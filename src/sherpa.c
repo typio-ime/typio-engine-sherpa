@@ -10,6 +10,7 @@
 
 #include <typio/abi/abi.h>
 #include <typio/schema/config_schema.h>
+#include <pthread.h>
 
 #include <sherpa-onnx/c-api/c-api.h>
 #include <curl/curl.h>
@@ -462,6 +463,25 @@ static const TypioConfigField sherpa_schema_fields[] = {
 
 /* ── Command surface (ADR-0008) ───────────────────────────────────────── */
 
+typedef struct {
+    TypioEngine *engine;
+} SherpaSetupJob;
+
+static void *sherpa_setup_thread(void *arg) {
+    SherpaSetupJob *job = arg;
+    TypioResult res = install_default_model(job->engine);
+    if (res == TYPIO_OK) {
+        SherpaState *state = (SherpaState *)typio_engine_get_user_data(job->engine);
+        if (state && state->instance) {
+            const SherpaInstallableModel *model = &sherpa_installable_models[0];
+            typio_instance_set_engine_config_key(
+                state->instance, "sherpa-onnx", "model", model->name);
+        }
+    }
+    free(job);
+    return NULL;
+}
+
 static const TypioEngineCommand sherpa_commands[] = {
     {.id = "setup", .label = "Download default model and configure"},
 };
@@ -475,16 +495,18 @@ static const TypioEngineCommand *sherpa_list_commands(TypioEngine *engine,
 
 static TypioResult sherpa_invoke_command(TypioEngine *engine, const char *id) {
     if (strcmp(id, "setup") == 0) {
-        TypioResult res = install_default_model(engine);
-        if (res != TYPIO_OK) {
-            return res;
+        SherpaSetupJob *job = calloc(1, sizeof(SherpaSetupJob));
+        if (!job) {
+            return TYPIO_ERROR_OUT_OF_MEMORY;
         }
-        SherpaState *state = (SherpaState *)typio_engine_get_user_data(engine);
-        if (state && state->instance) {
-            const SherpaInstallableModel *model = &sherpa_installable_models[0];
-            typio_instance_set_engine_config_key(
-                state->instance, "sherpa-onnx", "model", model->name);
+        job->engine = engine;
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, sherpa_setup_thread, job) != 0) {
+            free(job);
+            return TYPIO_ERROR;
         }
+        pthread_detach(tid);
+        typio_log_info("sherpa-onnx: setup started in background");
         return TYPIO_OK;
     }
     return TYPIO_ERROR_NOT_FOUND;
