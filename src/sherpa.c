@@ -9,6 +9,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <typio/abi/abi.h>
+#include <typio/schema/config_schema.h>
 
 #include <sherpa-onnx/c-api/c-api.h>
 #include <curl/curl.h>
@@ -440,10 +441,29 @@ static TypioResult install_default_model(TypioEngine *engine) {
     return TYPIO_OK;
 }
 
+/* ── Config schema ──────────────────────────────────────────────────────── */
+
+static const TypioConfigField sherpa_schema_fields[] = {
+    {
+        .key = "engines.sherpa-onnx.model",
+        .type = TYPIO_FIELD_STRING,
+        .def.s = "",
+        .ui_label = "Model directory name",
+        .ui_section = "voice",
+    },
+    {
+        .key = "engines.sherpa-onnx.language",
+        .type = TYPIO_FIELD_STRING,
+        .def.s = "auto",
+        .ui_label = "Language hint",
+        .ui_section = "voice",
+    },
+};
+
 /* ── Command surface (ADR-0008) ───────────────────────────────────────── */
 
 static const TypioEngineCommand sherpa_commands[] = {
-    {.id = "install-model", .label = "Install default SenseVoice model"},
+    {.id = "setup", .label = "Download default model and configure"},
 };
 
 static const TypioEngineCommand *sherpa_list_commands(TypioEngine *engine,
@@ -454,8 +474,18 @@ static const TypioEngineCommand *sherpa_list_commands(TypioEngine *engine,
 }
 
 static TypioResult sherpa_invoke_command(TypioEngine *engine, const char *id) {
-    if (strcmp(id, "install-model") == 0) {
-        return install_default_model(engine);
+    if (strcmp(id, "setup") == 0) {
+        TypioResult res = install_default_model(engine);
+        if (res != TYPIO_OK) {
+            return res;
+        }
+        SherpaState *state = (SherpaState *)typio_engine_get_user_data(engine);
+        if (state && state->instance) {
+            const SherpaInstallableModel *model = &sherpa_installable_models[0];
+            typio_instance_set_engine_config_key(
+                state->instance, "sherpa-onnx", "model", model->name);
+        }
+        return TYPIO_OK;
     }
     return TYPIO_ERROR_NOT_FOUND;
 }
@@ -475,6 +505,10 @@ static TypioResult sherpa_init(TypioEngine *engine, TypioInstance *instance) {
     state->instance = instance;
     typio_engine_set_user_data(engine, state);
     typio_engine_set_surface_ops(engine, &sherpa_surface);
+
+    typio_config_schema_register_many(
+        sherpa_schema_fields,
+        sizeof(sherpa_schema_fields) / sizeof(sherpa_schema_fields[0]));
 
     if (instance) {
         load_model(state, instance);
