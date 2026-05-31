@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Sherpa-ONNX voice engine symbolic -->
+  <!-- Microphone body -->
+  <rect x="6" y="3" width="4" height="7" rx="2" fill="none" stroke="#2e3436" stroke-width="1.4" stroke-linecap="round"/>
+  <!-- Microphone stand arc -->
+  <path d="M3 8 Q3 12 8 12 Q13 12 13 8" fill="none" stroke="#2e3436" stroke-width="1.4" stroke-linecap="round"/>
+  <!-- Microphone stem -->
+  <line x1="8" y1="12" x2="8" y2="14" stroke="#2e3436" stroke-width="1.4" stroke-linecap="round"/>
+</svg>
