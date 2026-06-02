@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.0.3
+
+- Fix `snprintf` truncation warning in `extract_files` by enlarging path buffers.
+
 ## v0.0.2
 
 - Rename install-model command to setup, register config schema, and auto-write model config.

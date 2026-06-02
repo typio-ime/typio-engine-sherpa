@@ -375,7 +375,7 @@ static TypioResult extract_files(const char *tar_path,
     }
 
     for (size_t i = 0; files[i]; i++) {
-        char src[512], dst[512];
+        char src[1024], dst[1024];
         snprintf(src, sizeof(src), "%s/%s", src_dir, files[i]);
         snprintf(dst, sizeof(dst), "%s/%s", dest_dir, files[i]);
 
