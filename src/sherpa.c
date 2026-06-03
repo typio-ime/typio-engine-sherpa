@@ -587,9 +587,11 @@ static TypioResult sherpa_reload_config(TypioEngine *engine) {
     return TYPIO_OK;
 }
 
-static bool sherpa_is_ready(TypioVoiceEngine *engine) {
-    SherpaState *state = (SherpaState *)typio_engine_get_user_data(&engine->base);
-    return state && state->recognizer != NULL;
+static TypioEngineAvailability sherpa_availability(TypioEngine *engine) {
+    SherpaState *state = (SherpaState *)typio_engine_get_user_data(engine);
+    return (state && state->recognizer)
+        ? TYPIO_ENGINE_READY
+        : TYPIO_ENGINE_PREPARING;
 }
 
 static char *sherpa_process_audio(TypioVoiceEngine *engine,
@@ -635,10 +637,10 @@ static TypioEngineBaseOps sherpa_base_ops = {
     .focus_out = sherpa_focus_out,
     .reset = sherpa_reset,
     .reload_config = sherpa_reload_config,
+    .availability = sherpa_availability,
 };
 
 static TypioVoiceEngineOps sherpa_voice_ops = {
-    .is_ready = sherpa_is_ready,
     .process_audio = sherpa_process_audio,
 };
 

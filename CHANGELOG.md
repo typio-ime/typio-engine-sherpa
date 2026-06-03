@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Migrate voice readiness from `TypioVoiceEngineOps::is_ready` to
+  `TypioEngineBaseOps::availability`.
+
 ## v0.0.3
 
 - Fix `snprintf` truncation warning in `extract_files` by enlarging path buffers.
