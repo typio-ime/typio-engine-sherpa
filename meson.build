@@ -1,5 +1,5 @@
 project('typio-engine-sherpa', 'c',
-    version: '0.0.3',
+    version: '0.0.4',
     default_options: [
         'c_std=c23',
         'warning_level=2',

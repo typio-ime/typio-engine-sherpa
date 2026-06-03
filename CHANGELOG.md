@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.4
+
 - Migrate voice readiness from `TypioVoiceEngineOps::is_ready` to
   `TypioEngineBaseOps::availability`.
 
