@@ -1,8 +1,8 @@
 /**
  * @file sherpa.c
- * @brief Sherpa-ONNX voice engine plugin for Typio
+ * @brief Sherpa-ONNX voice engine worker for Typio
  *
- * Out-of-tree plugin loaded at runtime by typio-core's engine manager.
+ * Out-of-process worker started at runtime from an engine manifest.
  * Links against libtypio (ABI) and sherpa-onnx-c-api.
  */
 
@@ -461,6 +461,14 @@ static const TypioConfigField sherpa_schema_fields[] = {
     },
 };
 
+TYPIO__EXTERN_C TYPIO_EXPORT const TypioConfigField *
+typio_engine_get_config_schema(size_t *out_count) {
+    if (out_count) {
+        *out_count = sizeof(sherpa_schema_fields) / sizeof(sherpa_schema_fields[0]);
+    }
+    return sherpa_schema_fields;
+}
+
 /* ── Command surface (ADR-0008) ───────────────────────────────────────── */
 
 typedef struct {
@@ -527,10 +535,6 @@ static TypioResult sherpa_init(TypioEngine *engine, TypioInstance *instance) {
     state->instance = instance;
     typio_engine_set_user_data(engine, state);
     typio_engine_set_surface_ops(engine, &sherpa_surface);
-
-    typio_config_schema_register_many(
-        sherpa_schema_fields,
-        sizeof(sherpa_schema_fields) / sizeof(sherpa_schema_fields[0]));
 
     if (instance) {
         load_model(state, instance);

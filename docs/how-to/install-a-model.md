@@ -1,6 +1,6 @@
 # How to Install a Speech Model
 
-The plugin ships no model. It loads one at focus-in time from the host's data
+The worker ships no model. It loads one at focus-in time from the host's data
 directory. Follow these steps to make a model available.
 
 ## How config maps to files
@@ -9,14 +9,14 @@ Two config keys drive loading:
 
 | Config key | What it selects | Example value |
 | --- | --- | --- |
-| `voice.engine` | Which engine plugin to load | `sherpa-onnx` |
+| `voice.engine` | Which voice engine to activate | `sherpa-onnx` |
 | `engines.sherpa-onnx.model` | Which model directory the engine uses | `sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17` |
 
 Loading chain:
 
 ```
 voice.engine = "sherpa-onnx"
-    → host loads libtypio_engine_sherpa.so from engine dirs
+    → host reads typio-engine-sherpa.toml and starts typio-engine-sherpa
 
 engines.sherpa-onnx.model = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
     → engine opens <data-dir>/sherpa-onnx/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/

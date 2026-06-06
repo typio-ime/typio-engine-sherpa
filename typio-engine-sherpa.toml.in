@@ -1,0 +1,11 @@
+name = "sherpa-onnx"
+type = "voice"
+display_name = "Sherpa-ONNX"
+description = "Voice input engine powered by sherpa-onnx."
+author = "Typio"
+icon = "typio-sherpa-symbolic"
+language = "und"
+command = "@ENGINE_COMMAND@"
+args = []
+required = ["voice_input"]
+optional = ["continuous_voice", "punctuation"]
