@@ -1,4 +1,5 @@
 #include "typio/abi/abi.h"
+#include "typio/abi/engine_protocol.h"
 #include "typio/runtime/instance.h"
 #include "typio/schema/config_schema.h"
 
@@ -6,6 +7,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static FILE *typio_engine_response_out;
+#undef stdout
+#define stdout typio_engine_response_out
 
 #if defined(__GNUC__) || defined(__clang__)
 #define TYPIO_WEAK __attribute__((weak))
@@ -121,7 +126,8 @@ static void write_mode_line(const char *prefix,
 
 static void commit_cb(TypioInputContext *ctx, const char *text, void *user_data) {
     (void)ctx;
-    FILE *out = user_data;
+    (void)user_data;
+    FILE *out = stdout;
     fputs("COMMIT\t", out);
     write_hex(out, text);
     fputc('\n', out);
@@ -131,7 +137,8 @@ static void composition_cb(TypioInputContext *ctx,
                            const TypioComposition *comp,
                            void *user_data) {
     (void)ctx;
-    FILE *out = user_data;
+    (void)user_data;
+    FILE *out = stdout;
     if (!comp) {
         fputs("CLEAR\n", out);
         return;
@@ -168,38 +175,38 @@ static bool worker_init(Worker *worker) {
 
     worker->info = typio_engine_get_info();
     if (!worker->info) {
-        fprintf(stderr, "typio-worker: engine returned null info\n");
+        fprintf(stderr, "typio-engine: engine returned null info\n");
         return false;
     }
 
     if (worker->info->type == TYPIO_ENGINE_TYPE_VOICE) {
         if (!typio_voice_engine_create) {
-            fprintf(stderr, "typio-worker: missing voice factory\n");
+            fprintf(stderr, "typio-engine: missing voice factory\n");
             return false;
         }
         worker->voice = typio_voice_engine_create();
         worker->base = worker->voice ? &worker->voice->base : NULL;
     } else {
         if (!typio_keyboard_engine_create) {
-            fprintf(stderr, "typio-worker: missing keyboard factory\n");
+            fprintf(stderr, "typio-engine: missing keyboard factory\n");
             return false;
         }
         worker->keyboard = typio_keyboard_engine_create();
         worker->base = worker->keyboard ? &worker->keyboard->base : NULL;
     }
     if (!worker->base || !worker->base->base_ops) {
-        fprintf(stderr, "typio-worker: factory returned invalid engine\n");
+        fprintf(stderr, "typio-engine: factory returned invalid engine\n");
         return false;
     }
 
     worker->instance = typio_instance_new();
     if (!worker->instance || typio_instance_init(worker->instance) != TYPIO_OK) {
-        fprintf(stderr, "typio-worker: failed to create local instance\n");
+        fprintf(stderr, "typio-engine: failed to create local instance\n");
         return false;
     }
     worker->ctx = typio_instance_create_context(worker->instance);
     if (!worker->ctx) {
-        fprintf(stderr, "typio-worker: failed to create local context\n");
+        fprintf(stderr, "typio-engine: failed to create local context\n");
         return false;
     }
     typio_input_context_set_commit_callback(worker->ctx, commit_cb, stdout);
@@ -210,7 +217,7 @@ static bool worker_init(Worker *worker) {
         TypioResult result = worker->base->base_ops->init(worker->base,
                                                           worker->instance);
         if (result != TYPIO_OK) {
-            fprintf(stderr, "typio-worker: engine init failed: %d\n", result);
+            fprintf(stderr, "typio-engine: engine init failed: %d\n", result);
             return false;
         }
     }
@@ -480,17 +487,71 @@ static bool handle_request(Worker *worker, char *line) {
 
 int main(void) {
     Worker worker = {0};
+    int protocol_fd = TYPIO_ENGINE_PROTOCOL_FD;
+    const char *fd_env = getenv("TYPIO_ENGINE_FD");
+    if (fd_env && *fd_env) {
+        protocol_fd = (int)strtol(fd_env, NULL, 10);
+    }
+    typio_engine_response_out = stderr;
     if (!worker_init(&worker)) {
         worker_destroy(&worker);
         return 1;
     }
 
-    char line[8192];
-    while (fgets(line, sizeof(line), stdin)) {
-        line[strcspn(line, "\r\n")] = '\0';
-        if (!handle_request(&worker, line)) {
+    if (!typio_engine_protocol_send_hello(protocol_fd,
+                                     worker.info ? worker.info->name : "sherpa-onnx",
+                                     "voice")) {
+        worker_destroy(&worker);
+        return 1;
+    }
+    TypioEngineProtocolFrame host_hello;
+    if (!typio_engine_protocol_read_frame(protocol_fd, &host_hello) ||
+        host_hello.message_type != TYPIO_ENGINE_PROTOCOL_HOST_HELLO) {
+        typio_engine_protocol_frame_free(&host_hello);
+        worker_destroy(&worker);
+        return 1;
+    }
+    typio_engine_protocol_frame_free(&host_hello);
+
+    while (true) {
+        TypioEngineProtocolFrame frame;
+        if (!typio_engine_protocol_read_frame(protocol_fd, &frame)) {
             break;
         }
+        if (frame.message_type != TYPIO_ENGINE_PROTOCOL_REQUEST || !frame.payload) {
+            typio_engine_protocol_send_error(protocol_fd,
+                                        frame.request_id,
+                                        "expected engine protocol request");
+            typio_engine_protocol_frame_free(&frame);
+            continue;
+        }
+
+        char *line = (char *)frame.payload;
+        if (strcmp(line, "shutdown") == 0) {
+            typio_engine_protocol_frame_free(&frame);
+            break;
+        }
+
+        char *response = NULL;
+        size_t response_len = 0;
+        FILE *mem = open_memstream(&response, &response_len);
+        if (!mem) {
+            typio_engine_protocol_send_error(protocol_fd,
+                                        frame.request_id,
+                                        "response buffer allocation failed");
+            typio_engine_protocol_frame_free(&frame);
+            continue;
+        }
+        typio_engine_response_out = mem;
+        (void)handle_request(&worker, line);
+        fclose(mem);
+        typio_engine_response_out = stderr;
+        typio_engine_protocol_send_response(protocol_fd,
+                                       frame.request_id,
+                                       response ? response : "",
+                                       response_len);
+        free(response);
+        typio_engine_protocol_frame_free(&frame);
     }
 
     worker_destroy(&worker);

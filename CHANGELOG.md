@@ -4,7 +4,7 @@
 
 ## v0.1.0 - 2026-06-06
 
-- Build Sherpa-ONNX as a direct IPC worker executable with a TOML manifest.
+- Build Sherpa-ONNX as a direct engine executable with a TOML manifest.
 - Install the private worker under `<libexecdir>/typio/engines` and the
   manifest under `<datadir>/typio/engines`.
 - Export the engine config schema before local instance initialization.

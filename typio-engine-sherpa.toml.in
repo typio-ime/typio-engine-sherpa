@@ -1,5 +1,6 @@
 name = "sherpa-onnx"
 type = "voice"
+protocol = "typio-engine-protocol"
 display_name = "Sherpa-ONNX"
 description = "Voice input engine powered by sherpa-onnx."
 author = "Typio"
