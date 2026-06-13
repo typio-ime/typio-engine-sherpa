@@ -6,6 +6,7 @@ description = "Voice input engine powered by sherpa-onnx."
 author = "Typio"
 icon = "typio-sherpa-symbolic"
 language = "und"
+languages = ["mul"]
 command = "@ENGINE_COMMAND@"
 args = []
 required = ["voice_input"]

@@ -498,9 +498,13 @@ int main(void) {
         return 1;
     }
 
+    const char *engine_type =
+        (worker.info && worker.info->type == TYPIO_ENGINE_TYPE_KEYBOARD)
+            ? "keyboard"
+            : "voice";
     if (!typio_engine_protocol_send_hello(protocol_fd,
-                                     worker.info ? worker.info->name : "sherpa-onnx",
-                                     "voice")) {
+                                     worker.info ? worker.info->name : "engine",
+                                     engine_type)) {
         worker_destroy(&worker);
         return 1;
     }
