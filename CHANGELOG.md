@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## v0.2.0 - 2026-06-13
+
+- Declare supported languages in the manifest (`languages = ["mul"]`) for
+  language-first switching (typio-linux ADR-0031).
+- worker_main: derive the protocol hello engine type from
+  `TypioEngineInfo.type` instead of hard-coding "voice", keeping the
+  harness copy-paste safe for keyboard engines.
+- Centralize recognizer loading in `ensure_model_loaded` and reload the
+  model immediately after a config change instead of waiting for the
+  next focus-in.
+
 ## v0.1.0 - 2026-06-06
 
 - Build Sherpa-ONNX as a direct engine executable with a TOML manifest.
