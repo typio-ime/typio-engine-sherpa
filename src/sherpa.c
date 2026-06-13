@@ -275,6 +275,28 @@ static bool load_model(SherpaState *state, TypioInstance *instance) {
     return true;
 }
 
+static bool ensure_model_loaded(TypioEngine *engine, const char *reason) {
+    const char *why = reason ? reason : "unspecified";
+    if (!engine || !engine->instance) {
+        typio_log_warning("sherpa-onnx: cannot load model: engine not initialized");
+        return false;
+    }
+    SherpaState *state = (SherpaState *)typio_engine_get_user_data(engine);
+    if (!state) {
+        typio_log_warning("sherpa-onnx: cannot load model: engine has no state");
+        return false;
+    }
+    if (state->recognizer) {
+        return true;
+    }
+    if (load_model(state, engine->instance)) {
+        typio_log_info("sherpa-onnx: model loaded (%s)", why);
+        return true;
+    }
+    typio_log_warning("sherpa-onnx: failed to load model (%s)", why);
+    return false;
+}
+
 /* ── Model download ───────────────────────────────────────────────────── */
 
 #define SHERPA_DEFAULT_MODEL_VERSION "2024-07-17"
@@ -536,9 +558,7 @@ static TypioResult sherpa_init(TypioEngine *engine, TypioInstance *instance) {
     typio_engine_set_user_data(engine, state);
     typio_engine_set_surface_ops(engine, &sherpa_surface);
 
-    if (instance) {
-        load_model(state, instance);
-    }
+    (void)ensure_model_loaded(engine, "init");
 
     return TYPIO_OK;
 }
@@ -562,15 +582,7 @@ static void sherpa_deactivate(TypioEngine *engine) {
 
 static void sherpa_focus_in(TypioEngine *engine, TypioInputContext *ctx) {
     (void)ctx;
-    SherpaState *state = (SherpaState *)typio_engine_get_user_data(engine);
-    if (!state || state->recognizer) {
-        return;
-    }
-    if (load_model(state, engine->instance)) {
-        typio_log_info("sherpa-onnx: model loaded");
-    } else {
-        typio_log_warning("sherpa-onnx: failed to load model");
-    }
+    (void)ensure_model_loaded(engine, "focus-in");
 }
 
 static void sherpa_focus_out(TypioEngine *engine, TypioInputContext *ctx) {
@@ -587,6 +599,7 @@ static TypioResult sherpa_reload_config(TypioEngine *engine) {
     SherpaState *state = (SherpaState *)typio_engine_get_user_data(engine);
     if (state) {
         unload_model(state);
+        (void)ensure_model_loaded(engine, "config reload");
     }
     return TYPIO_OK;
 }
