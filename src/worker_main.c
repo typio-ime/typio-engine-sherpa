@@ -103,7 +103,7 @@ static void write_hex_field(FILE *out, const char *text) {
 static void write_mode_line(const char *prefix,
                             const TypioKeyboardEngineMode *mode,
                             bool active) {
-    if (!mode || !mode->id || !mode->label) {
+    if (!mode || !mode->id) {
         return;
     }
     fputs(prefix, stdout);
@@ -121,7 +121,9 @@ static void write_mode_line(const char *prefix,
     write_hex_field(stdout, mode->profile_label);
     fputc('\t', stdout);
     write_hex_field(stdout, mode->description);
-    fprintf(stdout, "\t%d\n", active ? 1 : 0);
+    /* is_active, then salience (0=quiet, 1=notable) so the host can honour the
+     * engine's on-focus auto-reveal intent. */
+    fprintf(stdout, "\t%d\t%d\n", active ? 1 : 0, (int)mode->salience);
 }
 
 static void commit_cb(TypioInputContext *ctx, const char *text, void *user_data) {
@@ -225,14 +227,29 @@ static bool worker_init(Worker *worker) {
     return true;
 }
 
+/* Teardown runs active → deactivated → destroyed.
+ *
+ * 1. deactivate(): let the engine stop any background work and detach its
+ *    callbacks while everything is still alive (e.g. an async deployer or
+ *    model-loading thread can't notify into a half-freed instance).
+ * 2. free the instance: dropping its input contexts runs each context's
+ *    session destructor, which dereferences the still-live engine state.
+ * 3. free the engine: finalise the backend and release engine state.
+ *
+ * Freeing the engine before the instance would finalise the backend and
+ * free the state out from under the session destructors — a use-after-free
+ * crash on exit. */
 static void worker_destroy(Worker *worker) {
-    if (worker->base) {
-        typio_engine_free(worker->base);
-        worker->base = NULL;
+    if (worker->base && worker->base->base_ops->deactivate) {
+        worker->base->base_ops->deactivate(worker->base);
     }
     if (worker->instance) {
         typio_instance_free(worker->instance);
         worker->instance = NULL;
+    }
+    if (worker->base) {
+        typio_engine_free(worker->base);
+        worker->base = NULL;
     }
 }
 
@@ -374,6 +391,25 @@ static void handle_get_active_mode(Worker *worker) {
     write_mode_line("ACTIVE_MODE", mode, true);
 }
 
+/* Append an ACTIVE_MODE line reporting the engine's current keyboard mode.
+ *
+ * A worker is host-driven and has no asynchronous channel, so the reply to any
+ * request that may have flipped the internal mode is the only place to surface
+ * it. The framework caches the reported mode and notifies the host's indicator
+ * and tray on a transition. Emits nothing when the engine reports no mode;
+ * never prints OK/RESULT, so it is safe to call after a branch's own reply. */
+static void emit_active_mode(Worker *worker) {
+    if (!worker->keyboard || !worker->keyboard->keyboard ||
+        !worker->keyboard->keyboard->get_active_mode) {
+        return;
+    }
+    const TypioKeyboardEngineMode *mode =
+        worker->keyboard->keyboard->get_active_mode(worker->keyboard, worker->ctx);
+    if (mode) {
+        write_mode_line("ACTIVE_MODE", mode, true);
+    }
+}
+
 static void handle_set_active_mode(Worker *worker, char *save) {
     (void)field_next(&save);
     const char *encoded_mode_id = field_next(&save);
@@ -449,6 +485,7 @@ static bool handle_request(Worker *worker, char *line) {
             worker->base->base_ops->focus_in(worker->base, worker->ctx);
         }
         fputs("OK\n", stdout);
+        emit_active_mode(worker);
     } else if (strcmp(op, "focus-out") == 0) {
         if (worker->base->base_ops->focus_out) {
             worker->base->base_ops->focus_out(worker->base, worker->ctx);
@@ -459,8 +496,10 @@ static bool handle_request(Worker *worker, char *line) {
             worker->base->base_ops->reset(worker->base, worker->ctx);
         }
         fputs("OK\n", stdout);
+        emit_active_mode(worker);
     } else if (strcmp(op, "process-key") == 0) {
         handle_process_key(worker, save);
+        emit_active_mode(worker);
     } else if (strcmp(op, "process-audio") == 0) {
         handle_process_audio(worker, save);
     } else if (strcmp(op, "list-modes") == 0) {
@@ -469,6 +508,7 @@ static bool handle_request(Worker *worker, char *line) {
         handle_get_active_mode(worker);
     } else if (strcmp(op, "set-active-mode") == 0) {
         handle_set_active_mode(worker, save);
+        emit_active_mode(worker);
     } else if (strcmp(op, "commit-candidate") == 0) {
         handle_commit_candidate(worker, save);
     } else if (strcmp(op, "availability") == 0) {
