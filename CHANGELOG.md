@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v0.2.1 - 2026-06-19
+
+- `worker_main.c` is now byte-identical to the shared harness used by the
+  other engine workers. Adds the `salience` field to MODE/ACTIVE_MODE
+  lines, an `ACTIVE_MODE` line after every mode-affecting request, and
+  the safer teardown ordering (deactivate → instance → engine).
+
 ## v0.2.0 - 2026-06-13
 
 - Declare supported languages in the manifest (`languages = ["mul"]`) for
