@@ -604,6 +604,16 @@ static TypioResult sherpa_reload_config(TypioEngine *engine) {
     return TYPIO_OK;
 }
 
+/* Per-key live reaction is unnecessary for sherpa-onnx: the only configured
+ * values are model paths, which reload_config covers via a full reload. */
+static void sherpa_on_config_change(TypioEngine *engine,
+                                     const char *key,
+                                     const char *value) {
+    (void)engine;
+    (void)key;
+    (void)value;
+}
+
 static TypioEngineAvailability sherpa_availability(TypioEngine *engine) {
     SherpaState *state = (SherpaState *)typio_engine_get_user_data(engine);
     return (state && state->recognizer)
@@ -654,6 +664,7 @@ static TypioEngineBaseOps sherpa_base_ops = {
     .focus_out = sherpa_focus_out,
     .reset = sherpa_reset,
     .reload_config = sherpa_reload_config,
+    .on_config_change = sherpa_on_config_change,
     .availability = sherpa_availability,
 };
 
@@ -669,9 +680,9 @@ static const char *const sherpa_required_caps[] = {
 static TypioEngineInfo sherpa_info = {
     .name = "sherpa-onnx",
     .display_name = "Sherpa-ONNX",
-    .description = "Speech-to-text via sherpa-onnx",
+    .description = "Voice input engine powered by sherpa-onnx.",
     .author = "Typio",
-    .icon = "typio-sherpa",
+    .icon = "typio-sherpa-symbolic",
     .language = "und",
     .type = TYPIO_ENGINE_TYPE_VOICE,
     .required_capabilities = sherpa_required_caps,

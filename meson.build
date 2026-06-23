@@ -59,7 +59,7 @@ install_data(installed_manifest,
     rename: 'typio-engine-sherpa.toml',
 )
 
-# Install freedesktop icons so hosts can resolve "typio-sherpa" via the icon theme.
+# Install freedesktop icons so hosts can resolve "typio-sherpa-symbolic" via the icon theme.
 icon_dir = get_option('datadir') / 'icons' / 'hicolor' / 'scalable' / 'apps'
 install_data(
     'data/icons/hicolor/scalable/apps/typio-sherpa-symbolic.svg',

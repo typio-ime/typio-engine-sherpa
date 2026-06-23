@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **Engine info aligned with manifest.** `sherpa_info.icon` now reports
+  `typio-sherpa-symbolic` (was the stale `typio-sherpa`) and
+  `sherpa_info.description` now reads "Voice input engine powered by
+  sherpa-onnx." — both matching the values the manifest already ships. Hosts
+  read metadata from the manifest, so this is cosmetic when queried via the
+  C ABI, but keeps the two sources of truth in agreement.
+- **`sherpa_base_ops` now provides `on_config_change`.** Matches the
+  `TypioEngineBaseOps` contract documented in
+  `libtypio include/typio/abi/engine.h` (all callbacks must be present;
+  supply a no-op when the behaviour is not needed). The implementation is a
+  no-op: the only configured values are model paths, which `reload_config`
+  already handles via a full reload.
+- Stale comment in `meson.build` updated to reference the installed
+  `typio-sherpa-symbolic` icon name.
+
 ## v0.2.1 - 2026-06-19
 
 - `worker_main.c` is now byte-identical to the shared harness used by the
