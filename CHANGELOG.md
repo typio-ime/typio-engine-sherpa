@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.2 - 2026-06-23
 
 - **Engine info aligned with manifest.** `sherpa_info.icon` now reports
   `typio-sherpa-symbolic` (was the stale `typio-sherpa`) and
