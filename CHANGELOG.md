@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+- **Pinned upstream compatibility CI.** The production build now compiles the
+  worker with warnings as errors against a fixed sherpa-onnx C API revision
+  and verifies its installed worker, manifest, and icon layout.
+- **ABI compatibility gate.** The worker validates the engine's exported ABI
+  version before reading schema metadata or constructing model state.
+- **Schema-first worker handshake.** The shared worker publishes Sherpa's
+  config schema before model construction, tolerates host discovery probes
+  that close before HostHello, and validates the required voice operation.
+- **Setup command is reachable and safe across worker shutdown.** Typio Engine
+  Protocol now exposes the engine's `setup` command. The background installer
+  is single-flight, cancellable, and joined during teardown, preventing its
+  engine pointer from outliving `SherpaState` or delaying shutdown for the
+  full network timeout. A completed setup is loaded during the next
+  availability check, while later workers find it through normal model
+  auto-detection.
+- **Model installation rejects truncated paths and unsafe extraction state.**
+  Path joins now fail explicitly instead of using truncated buffers, downloads
+  handle partial writes, use HTTPS-only redirects and bounded transfer
+  timeouts, and verify the pinned release asset's SHA-256 digest. Archives
+  extract into a private temporary directory, and incomplete model directories
+  are repaired instead of treated as installed.
+
 ## v0.2.2 - 2026-06-23
 
 - **Engine info aligned with manifest.** `sherpa_info.icon` now reports

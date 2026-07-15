@@ -14,6 +14,7 @@
 
 #include <sherpa-onnx/c-api/c-api.h>
 #include <curl/curl.h>
+#include <openssl/evp.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -27,8 +28,12 @@
 typedef struct {
     const SherpaOnnxOfflineRecognizer *recognizer;
     TypioInstance *instance;
-    char language[16];
-    char model_hint[64];
+    pthread_mutex_t setup_lock;
+    pthread_t setup_thread;
+    bool setup_thread_valid;
+    bool setup_running;
+    bool setup_cancel;
+    bool setup_model_ready;
 } SherpaState;
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
@@ -36,6 +41,19 @@ typedef struct {
 static bool file_exists(const char *path) {
     struct stat st;
     return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static bool join_path(char *buf, size_t buf_size,
+                      const char *dir, const char *name) {
+    if (!buf || buf_size == 0 || !dir || !name) {
+        return false;
+    }
+    int written = snprintf(buf, buf_size, "%s/%s", dir, name);
+    if (written < 0 || (size_t)written >= buf_size) {
+        buf[0] = '\0';
+        return false;
+    }
+    return true;
 }
 
 static bool find_file_with_suffix(const char *dir, const char *suffix,
@@ -50,7 +68,10 @@ static bool find_file_with_suffix(const char *dir, const char *suffix,
         size_t name_len = strlen(ent->d_name);
         if (name_len >= suf_len &&
             strcmp(ent->d_name + name_len - suf_len, suffix) == 0) {
-            snprintf(buf, buf_size, "%s/%s", dir, ent->d_name);
+            if (!join_path(buf, buf_size, dir, ent->d_name)) {
+                closedir(d);
+                return false;
+            }
             closedir(d);
             return true;
         }
@@ -62,7 +83,9 @@ static bool find_file_with_suffix(const char *dir, const char *suffix,
 static bool find_model_file(const char *dir, const char *exact,
                             const char *suffix_fallback,
                             char *buf, size_t buf_size) {
-    snprintf(buf, buf_size, "%s/%s", dir, exact);
+    if (!join_path(buf, buf_size, dir, exact)) {
+        return false;
+    }
     if (file_exists(buf)) {
         return true;
     }
@@ -147,9 +170,11 @@ static bool auto_detect_model_dir(const char *base_dir,
         if (ent->d_name[0] == '.') {
             continue;
         }
-        snprintf(model_dir, dir_size, "%s/%s", base_dir, ent->d_name);
+        if (!join_path(model_dir, dir_size, base_dir, ent->d_name)) {
+            continue;
+        }
         struct stat st;
-        if (stat(model_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        if (lstat(model_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
             continue;
         }
         *out_type = detect_model_type(model_dir, tokens_buf, f1, f2, f3,
@@ -190,7 +215,10 @@ static bool load_model(SherpaState *state, TypioInstance *instance) {
     }
 
     char base_dir[512];
-    snprintf(base_dir, sizeof(base_dir), "%s/sherpa-onnx", data_dir);
+    if (!join_path(base_dir, sizeof(base_dir), data_dir, "sherpa-onnx")) {
+        typio_log_warning("sherpa-onnx: data directory path is too long");
+        return false;
+    }
 
     char model_dir[512];
     char tokens_path[512] = {};
@@ -200,8 +228,7 @@ static bool load_model(SherpaState *state, TypioInstance *instance) {
     SherpaModelType type = SHERPA_MODEL_UNKNOWN;
 
     if (model_hint && *model_hint) {
-        int ret = snprintf(model_dir, sizeof(model_dir), "%s/%s", base_dir, model_hint);
-        if (ret >= 0 && (size_t)ret < sizeof(model_dir)) {
+        if (join_path(model_dir, sizeof(model_dir), base_dir, model_hint)) {
             type = detect_model_type(model_dir, tokens_path, file1, file2, file3,
                                      sizeof(tokens_path));
         }
@@ -266,12 +293,6 @@ static bool load_model(SherpaState *state, TypioInstance *instance) {
                    model_type_name(type), model_dir);
 
     state->recognizer = recognizer;
-    if (language) {
-        strncpy(state->language, language, sizeof(state->language) - 1);
-    }
-    if (model_hint) {
-        strncpy(state->model_hint, model_hint, sizeof(state->model_hint) - 1);
-    }
     return true;
 }
 
@@ -306,6 +327,7 @@ static bool ensure_model_loaded(TypioEngine *engine, const char *reason) {
 typedef struct {
     const char *name;
     const char *url_suffix;
+    const char *sha256;
     const char *files[4];
 } SherpaInstallableModel;
 
@@ -314,19 +336,109 @@ static const SherpaInstallableModel sherpa_installable_models[] = {
         .name = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-" SHERPA_DEFAULT_MODEL_VERSION,
         .url_suffix = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-"
                       SHERPA_DEFAULT_MODEL_VERSION ".tar.bz2",
+        .sha256 = "7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e",
         .files = {"model.int8.onnx", "tokens.txt", NULL},
     },
 };
 
-static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *ud) {
-    int fd = *(int *)ud;
-    size_t total = size * nmemb;
-    ssize_t written = write(fd, ptr, total);
-    return (written < 0) ? 0 : (size_t)written;
+static bool setup_cancelled(SherpaState *state) {
+    pthread_mutex_lock(&state->setup_lock);
+    bool cancelled = state->setup_cancel;
+    pthread_mutex_unlock(&state->setup_lock);
+    return cancelled;
 }
 
-static TypioResult download_to_tmp(const char *url, char *tmp_path, size_t path_size) {
-    snprintf(tmp_path, path_size, "/tmp/typio-model-download-XXXXXX");
+static int download_progress(void *ud,
+                             curl_off_t download_total,
+                             curl_off_t download_now,
+                             curl_off_t upload_total,
+                             curl_off_t upload_now) {
+    (void)download_total;
+    (void)download_now;
+    (void)upload_total;
+    (void)upload_now;
+    return setup_cancelled(ud) ? 1 : 0;
+}
+
+static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *ud) {
+    int fd = *(int *)ud;
+    if (size != 0 && nmemb > SIZE_MAX / size) {
+        return 0;
+    }
+    size_t total = size * nmemb;
+    size_t offset = 0;
+    while (offset < total) {
+        ssize_t written = write(fd, (const char *)ptr + offset, total - offset);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return offset;
+        }
+        if (written == 0) {
+            return offset;
+        }
+        offset += (size_t)written;
+    }
+    return total;
+}
+
+static bool sha256_matches(const char *path, const char *expected) {
+    static const char hex[] = "0123456789abcdef";
+    unsigned char buffer[64 * 1024];
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_len = 0;
+    bool ok = false;
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (fd < 0 || !ctx || EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        EVP_MD_CTX_free(ctx);
+        return false;
+    }
+
+    for (;;) {
+        ssize_t count = read(fd, buffer, sizeof(buffer));
+        if (count > 0) {
+            if (EVP_DigestUpdate(ctx, buffer, (size_t)count) != 1) {
+                break;
+            }
+            continue;
+        }
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count == 0 &&
+            EVP_DigestFinal_ex(ctx, digest, &digest_len) == 1 &&
+            digest_len == 32) {
+            char actual[65];
+            for (unsigned int i = 0; i < digest_len; i++) {
+                actual[i * 2] = hex[digest[i] >> 4];
+                actual[i * 2 + 1] = hex[digest[i] & 0x0f];
+            }
+            actual[64] = '\0';
+            ok = strcmp(actual, expected) == 0;
+        }
+        break;
+    }
+
+    close(fd);
+    EVP_MD_CTX_free(ctx);
+    return ok;
+}
+
+static TypioResult download_to_tmp(SherpaState *state,
+                                   const char *url,
+                                   char *tmp_path,
+                                   size_t path_size) {
+    static const char path_template[] = "/tmp/typio-model-download-XXXXXX";
+    if (path_size < sizeof(path_template)) {
+        return TYPIO_ERROR_INVALID_ARGUMENT;
+    }
+    memcpy(tmp_path, path_template, sizeof(path_template));
     int fd = mkstemp(tmp_path);
     if (fd < 0) {
         return TYPIO_ERROR;
@@ -344,6 +456,16 @@ static TypioResult download_to_tmp(const char *url, char *tmp_path, size_t path_
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &fd);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "typio-engine-sherpa/0.2.2");
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 900L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, download_progress);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, state);
 
     CURLcode res = curl_easy_perform(curl);
     curl_easy_cleanup(curl);
@@ -356,63 +478,114 @@ static TypioResult download_to_tmp(const char *url, char *tmp_path, size_t path_
     return TYPIO_OK;
 }
 
+static bool ensure_directory(const char *path) {
+    if (mkdir(path, 0755) == 0) {
+        return true;
+    }
+    if (errno != EEXIST) {
+        return false;
+    }
+    struct stat st;
+    return lstat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static bool wait_child_success(pid_t pid) {
+    int status = 0;
+    pid_t result;
+    do {
+        result = waitpid(pid, &status, 0);
+    } while (result < 0 && errno == EINTR);
+    return result == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static void remove_tree(const char *path) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("rm", "rm", "-rf", "--", path, (char *)NULL);
+        _exit(127);
+    }
+    if (pid > 0) {
+        (void)wait_child_success(pid);
+    }
+}
+
 static TypioResult extract_files(const char *tar_path,
                                   const char *dest_dir,
                                   const char *const *files) {
-    mkdir(dest_dir, 0755);
+    char extract_root[] = "/tmp/typio-model-extract-XXXXXX";
+    if (!mkdtemp(extract_root)) {
+        return TYPIO_ERROR;
+    }
 
     pid_t pid = fork();
     if (pid < 0) {
+        remove_tree(extract_root);
         return TYPIO_ERROR;
     }
     if (pid == 0) {
         execlp("tar", "tar", "xf", tar_path,
-               "-C", "/tmp", "--no-anchored",
+               "-C", extract_root,
+               "--no-same-owner", "--no-same-permissions",
                (char *)NULL);
         _exit(127);
     }
-    int status;
-    waitpid(pid, &status, 0);
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    if (!wait_child_success(pid)) {
+        remove_tree(extract_root);
         return TYPIO_ERROR;
     }
 
     char src_dir[512];
-    const char *tmp = "/tmp";
-    int found = 0;
-    DIR *d = opendir(tmp);
+    bool found = false;
+    DIR *d = opendir(extract_root);
     if (d) {
+        static const char model_prefix[] = "sherpa-onnx-sense-voice";
         struct dirent *ent;
         while ((ent = readdir(d))) {
-            if (strstr(ent->d_name, "sherpa-onnx-sense-voice")) {
-                snprintf(src_dir, sizeof(src_dir), "/tmp/%s", ent->d_name);
-                found = 1;
-                break;
+            if (strncmp(ent->d_name, model_prefix, sizeof(model_prefix) - 1) == 0 &&
+                join_path(src_dir, sizeof(src_dir), extract_root, ent->d_name)) {
+                struct stat st;
+                if (lstat(src_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
+                    found = true;
+                    break;
+                }
             }
         }
         closedir(d);
     }
     if (!found) {
+        remove_tree(extract_root);
         return TYPIO_ERROR;
     }
 
     for (size_t i = 0; files[i]; i++) {
         char src[1024], dst[1024];
-        snprintf(src, sizeof(src), "%s/%s", src_dir, files[i]);
-        snprintf(dst, sizeof(dst), "%s/%s", dest_dir, files[i]);
+        if (!join_path(src, sizeof(src), src_dir, files[i]) ||
+            !join_path(dst, sizeof(dst), dest_dir, files[i])) {
+            remove_tree(extract_root);
+            return TYPIO_ERROR;
+        }
+        struct stat st;
+        if (lstat(src, &st) != 0 || !S_ISREG(st.st_mode)) {
+            remove_tree(extract_root);
+            return TYPIO_ERROR;
+        }
 
         pid_t cp = fork();
+        if (cp < 0) {
+            remove_tree(extract_root);
+            return TYPIO_ERROR;
+        }
         if (cp == 0) {
-            execlp("cp", "cp", src, dst, (char *)NULL);
+            execlp("cp", "cp", "--", src, dst, (char *)NULL);
             _exit(127);
         }
-        int cs;
-        waitpid(cp, &cs, 0);
-        if (!WIFEXITED(cs) || WEXITSTATUS(cs) != 0) {
+        if (!wait_child_success(cp)) {
+            remove_tree(extract_root);
             return TYPIO_ERROR;
         }
     }
 
+    remove_tree(extract_root);
     return TYPIO_OK;
 }
 
@@ -429,27 +602,61 @@ static TypioResult install_default_model(TypioEngine *engine) {
         return TYPIO_ERROR_NOT_INITIALIZED;
     }
 
+    char model_root[512];
     char dest_dir[512];
-    snprintf(dest_dir, sizeof(dest_dir), "%s/sherpa-onnx/%s",
-             data_dir, model->name);
+    if (!join_path(model_root, sizeof(model_root), data_dir, "sherpa-onnx") ||
+        !join_path(dest_dir, sizeof(dest_dir), model_root, model->name)) {
+        typio_log_error("sherpa-onnx: model destination path is too long");
+        return TYPIO_ERROR_INVALID_ARGUMENT;
+    }
 
     struct stat st;
-    if (stat(dest_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
-        typio_log_info("sherpa-onnx: model '%s' already installed at %s",
-                       model->name, dest_dir);
-        return TYPIO_OK;
+    if (lstat(dest_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
+        bool complete = true;
+        for (size_t i = 0; model->files[i]; i++) {
+            char path[1024];
+            if (!join_path(path, sizeof(path), dest_dir, model->files[i]) ||
+                !file_exists(path)) {
+                complete = false;
+                break;
+            }
+        }
+        if (complete) {
+            typio_log_info("sherpa-onnx: model '%s' already installed at %s",
+                           model->name, dest_dir);
+            return TYPIO_OK;
+        }
+        typio_log_warning("sherpa-onnx: repairing incomplete model at %s",
+                          dest_dir);
+    }
+
+    if (!ensure_directory(model_root) || !ensure_directory(dest_dir)) {
+        typio_log_error("sherpa-onnx: cannot create model directory %s", dest_dir);
+        return TYPIO_ERROR;
     }
 
     char url[1024];
-    snprintf(url, sizeof(url), "%s/%s", SHERPA_MODEL_BASE_URL, model->url_suffix);
+    if (!join_path(url, sizeof(url), SHERPA_MODEL_BASE_URL, model->url_suffix)) {
+        return TYPIO_ERROR_INVALID_ARGUMENT;
+    }
 
     typio_log_info("sherpa-onnx: downloading %s", model->url_suffix);
 
     char tmp_path[512];
-    TypioResult res = download_to_tmp(url, tmp_path, sizeof(tmp_path));
+    TypioResult res = download_to_tmp(state, url, tmp_path, sizeof(tmp_path));
     if (res != TYPIO_OK) {
-        typio_log_error("sherpa-onnx: download failed");
+        if (setup_cancelled(state)) {
+            typio_log_info("sherpa-onnx: download cancelled");
+        } else {
+            typio_log_error("sherpa-onnx: download failed");
+        }
         return res;
+    }
+
+    if (!sha256_matches(tmp_path, model->sha256)) {
+        unlink(tmp_path);
+        typio_log_error("sherpa-onnx: downloaded model checksum mismatch");
+        return TYPIO_ERROR;
     }
 
     res = extract_files(tmp_path, dest_dir, model->files);
@@ -499,21 +706,20 @@ typedef struct {
 
 static void *sherpa_setup_thread(void *arg) {
     SherpaSetupJob *job = arg;
+    SherpaState *state = (SherpaState *)typio_engine_get_user_data(job->engine);
     TypioResult res = install_default_model(job->engine);
-    if (res == TYPIO_OK) {
-        SherpaState *state = (SherpaState *)typio_engine_get_user_data(job->engine);
-        if (state && state->instance) {
-            const SherpaInstallableModel *model = &sherpa_installable_models[0];
-            typio_instance_set_engine_config_key(
-                state->instance, "sherpa-onnx", "model", model->name);
-        }
+    if (state) {
+        pthread_mutex_lock(&state->setup_lock);
+        state->setup_model_ready = res == TYPIO_OK;
+        state->setup_running = false;
+        pthread_mutex_unlock(&state->setup_lock);
     }
     free(job);
     return NULL;
 }
 
 static const TypioEngineCommand sherpa_commands[] = {
-    {.id = "setup", .label = "Download default model and configure"},
+    {.id = "setup", .label = "Download and verify default model"},
 };
 
 static const TypioEngineCommand *sherpa_list_commands(TypioEngine *engine,
@@ -525,17 +731,43 @@ static const TypioEngineCommand *sherpa_list_commands(TypioEngine *engine,
 
 static TypioResult sherpa_invoke_command(TypioEngine *engine, const char *id) {
     if (strcmp(id, "setup") == 0) {
+        SherpaState *state = (SherpaState *)typio_engine_get_user_data(engine);
+        if (!state) {
+            return TYPIO_ERROR_NOT_INITIALIZED;
+        }
+
+        pthread_mutex_lock(&state->setup_lock);
+        if (state->setup_running) {
+            pthread_mutex_unlock(&state->setup_lock);
+            typio_log_info("sherpa-onnx: setup is already running");
+            return TYPIO_OK;
+        }
+        if (state->setup_thread_valid) {
+            pthread_t completed = state->setup_thread;
+            state->setup_thread_valid = false;
+            pthread_mutex_unlock(&state->setup_lock);
+            (void)pthread_join(completed, NULL);
+            pthread_mutex_lock(&state->setup_lock);
+        }
+
         SherpaSetupJob *job = calloc(1, sizeof(SherpaSetupJob));
         if (!job) {
+            pthread_mutex_unlock(&state->setup_lock);
             return TYPIO_ERROR_OUT_OF_MEMORY;
         }
         job->engine = engine;
-        pthread_t tid;
-        if (pthread_create(&tid, NULL, sherpa_setup_thread, job) != 0) {
+        state->setup_cancel = false;
+        state->setup_model_ready = false;
+        state->setup_running = true;
+        if (pthread_create(&state->setup_thread, NULL,
+                           sherpa_setup_thread, job) != 0) {
+            state->setup_running = false;
+            pthread_mutex_unlock(&state->setup_lock);
             free(job);
             return TYPIO_ERROR;
         }
-        pthread_detach(tid);
+        state->setup_thread_valid = true;
+        pthread_mutex_unlock(&state->setup_lock);
         typio_log_info("sherpa-onnx: setup started in background");
         return TYPIO_OK;
     }
@@ -554,6 +786,15 @@ static TypioResult sherpa_init(TypioEngine *engine, TypioInstance *instance) {
     if (!state) {
         return TYPIO_ERROR_OUT_OF_MEMORY;
     }
+    if (pthread_mutex_init(&state->setup_lock, NULL) != 0) {
+        free(state);
+        return TYPIO_ERROR;
+    }
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+        pthread_mutex_destroy(&state->setup_lock);
+        free(state);
+        return TYPIO_ERROR;
+    }
     state->instance = instance;
     typio_engine_set_user_data(engine, state);
     typio_engine_set_surface_ops(engine, &sherpa_surface);
@@ -566,19 +807,24 @@ static TypioResult sherpa_init(TypioEngine *engine, TypioInstance *instance) {
 static void sherpa_destroy(TypioEngine *engine) {
     SherpaState *state = (SherpaState *)typio_engine_get_user_data(engine);
     if (state) {
+        pthread_mutex_lock(&state->setup_lock);
+        bool join_setup = state->setup_thread_valid;
+        pthread_t setup_thread = state->setup_thread;
+        state->setup_cancel = true;
+        state->setup_thread_valid = false;
+        pthread_mutex_unlock(&state->setup_lock);
+        if (join_setup) {
+            (void)pthread_join(setup_thread, NULL);
+        }
         unload_model(state);
+        curl_global_cleanup();
+        pthread_mutex_destroy(&state->setup_lock);
         free(state);
         typio_engine_set_user_data(engine, NULL);
     }
 }
 
-static void sherpa_deactivate(TypioEngine *engine) {
-    SherpaState *state = (SherpaState *)typio_engine_get_user_data(engine);
-    if (state) {
-        unload_model(state);
-        typio_log_info("sherpa-onnx: model freed on deactivate");
-    }
-}
+
 
 static void sherpa_focus_in(TypioEngine *engine, TypioInputContext *ctx) {
     (void)ctx;
@@ -616,6 +862,15 @@ static void sherpa_on_config_change(TypioEngine *engine,
 
 static TypioEngineAvailability sherpa_availability(TypioEngine *engine) {
     SherpaState *state = (SherpaState *)typio_engine_get_user_data(engine);
+    if (state && !state->recognizer) {
+        pthread_mutex_lock(&state->setup_lock);
+        bool load_installed_model = state->setup_model_ready;
+        state->setup_model_ready = false;
+        pthread_mutex_unlock(&state->setup_lock);
+        if (load_installed_model) {
+            (void)ensure_model_loaded(engine, "setup completed");
+        }
+    }
     return (state && state->recognizer)
         ? TYPIO_ENGINE_READY
         : TYPIO_ENGINE_PREPARING;
@@ -659,7 +914,6 @@ static char *sherpa_process_audio(TypioVoiceEngine *engine,
 static TypioEngineBaseOps sherpa_base_ops = {
     .init = sherpa_init,
     .destroy = sherpa_destroy,
-    .deactivate = sherpa_deactivate,
     .focus_in = sherpa_focus_in,
     .focus_out = sherpa_focus_out,
     .reset = sherpa_reset,

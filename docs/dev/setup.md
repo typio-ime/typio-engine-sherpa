@@ -7,7 +7,7 @@
 | Meson `>= 1.0.0`  | Build system                | Requires `c_std=c23`.           |
 | Ninja             | Build backend               |                                 |
 | C23 compiler      | Compilation                 | GCC 13+ or Clang 16+.           |
-| `typio-engine-abi`| Engine ABI headers + pc     | From libtypio.                  |
+| `typio-engine-abi` | Engine ABI headers + pc    | From the Typio workspace.      |
 | `sherpa-onnx`     | STT runtime                 | Falls back to `LIBRARY_PATH`.   |
 
 ## Build
@@ -19,12 +19,12 @@ ninja -C build
 
 ## Development Run
 
-From the `typio-linux` repository:
+With a release build of the Typio workspace:
 
 ```sh
-LD_LIBRARY_PATH=../libtypio/target/release \
-  ./build/src/typio --verbose \
-  --engine-dir ../typio-engine-sherpa/build
+LD_LIBRARY_PATH=/path/to/typio/target/release \
+  /path/to/typio/target/release/typio --verbose \
+  --engine-dir "$PWD/build"
 ```
 
 The build directory contains `typio-engine-sherpa` and its development
@@ -34,11 +34,11 @@ directory.
 <details>
 <summary>Using a local libtypio build</summary>
 
-Adjust the paths if your checkout is not at `../libtypio`.
+Adjust `/path/to/typio` for your checkout.
 
 ```sh
-cargo build --release --manifest-path ../libtypio/Cargo.toml
-export PKG_CONFIG_PATH="../libtypio/target/release${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+cargo build --release -p typio-core --manifest-path /path/to/typio/Cargo.toml
+export PKG_CONFIG_PATH="/path/to/typio/target/release${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 meson setup --wipe build
 ninja -C build
 ```

@@ -24,14 +24,15 @@ endif
 
 sherpa_src = files('src/sherpa.c', 'src/worker_main.c')
 
-curl_dep = dependency('libcurl', required: true)
+curl_dep = dependency('libcurl', version: '>=7.85.0', required: true)
+crypto_dep = dependency('libcrypto', required: true)
 
 worker_install_dir = get_option('libexecdir') / 'typio' / 'engines'
 manifest_install_dir = get_option('datadir') / 'typio' / 'engines'
 
 sherpa_worker = executable('typio-engine-sherpa',
     sherpa_src,
-    dependencies: [typio_abi, sherpa_onnx_dep, curl_dep],
+    dependencies: [typio_abi, sherpa_onnx_dep, curl_dep, crypto_dep],
     install: true,
     install_dir: worker_install_dir,
 )

@@ -18,6 +18,7 @@ static FILE *typio_engine_response_out;
 #define TYPIO_WEAK
 #endif
 
+TYPIO__EXTERN_C const TypioAbiVersion *typio_engine_abi_version(void);
 TYPIO__EXTERN_C const TypioEngineInfo *typio_engine_get_info(void);
 TYPIO__EXTERN_C TypioKeyboardEngine *typio_keyboard_engine_create(void) TYPIO_WEAK;
 TYPIO__EXTERN_C TypioVoiceEngine *typio_voice_engine_create(void) TYPIO_WEAK;
@@ -31,6 +32,8 @@ typedef struct {
     TypioKeyboardEngine *keyboard;
     TypioVoiceEngine *voice;
     TypioEngine *base;
+    const TypioConfigField *schema;
+    size_t schema_count;
 } Worker;
 
 static void write_hex(FILE *out, const char *text) {
@@ -126,6 +129,17 @@ static void write_mode_line(const char *prefix,
     fprintf(stdout, "\t%d\t%d\n", active ? 1 : 0, (int)mode->salience);
 }
 
+static void write_command_line(const TypioEngineCommand *command) {
+    if (!command || !command->id || !*command->id) {
+        return;
+    }
+    fputs("COMMAND\t", stdout);
+    write_hex_field(stdout, command->id);
+    fputc('\t', stdout);
+    write_hex_field(stdout, command->label);
+    fputc('\n', stdout);
+}
+
 static void commit_cb(TypioInputContext *ctx, const char *text, void *user_data) {
     (void)ctx;
     (void)user_data;
@@ -166,12 +180,26 @@ static void composition_cb(TypioInputContext *ctx,
     fputc('\n', out);
 }
 
-static bool worker_init(Worker *worker) {
+static bool worker_prepare(Worker *worker) {
+    const TypioAbiVersion *abi = typio_engine_abi_version();
+    if (!typio_engine_abi_check(abi)) {
+        fprintf(stderr,
+                "typio-engine: incompatible ABI %u.%u (runtime %u.%u)\n",
+                abi ? abi->major : UINT32_MAX,
+                abi ? abi->minor : UINT32_MAX,
+                TYPIO_ENGINE_ABI_MAJOR,
+                TYPIO_ENGINE_ABI_MINOR);
+        return false;
+    }
+
     if (typio_engine_get_config_schema) {
-        size_t count = 0;
-        const TypioConfigField *fields = typio_engine_get_config_schema(&count);
-        if (fields && count > 0) {
-            typio_config_schema_register_many(fields, count);
+        worker->schema =
+            typio_engine_get_config_schema(&worker->schema_count);
+        if (worker->schema && worker->schema_count > 0 &&
+            typio_config_schema_register_many(worker->schema,
+                                              worker->schema_count) != TYPIO_OK) {
+            fprintf(stderr, "typio-engine: invalid config schema\n");
+            return false;
         }
     }
 
@@ -180,7 +208,10 @@ static bool worker_init(Worker *worker) {
         fprintf(stderr, "typio-engine: engine returned null info\n");
         return false;
     }
+    return true;
+}
 
+static bool worker_start(Worker *worker) {
     if (worker->info->type == TYPIO_ENGINE_TYPE_VOICE) {
         if (!typio_voice_engine_create) {
             fprintf(stderr, "typio-engine: missing voice factory\n");
@@ -198,6 +229,14 @@ static bool worker_init(Worker *worker) {
     }
     if (!worker->base || !worker->base->base_ops) {
         fprintf(stderr, "typio-engine: factory returned invalid engine\n");
+        return false;
+    }
+    if ((worker->info->type == TYPIO_ENGINE_TYPE_VOICE &&
+         (!worker->voice->voice || !worker->voice->voice->process_audio)) ||
+        (worker->info->type == TYPIO_ENGINE_TYPE_KEYBOARD &&
+         (!worker->keyboard->keyboard ||
+          !worker->keyboard->keyboard->process_key))) {
+        fprintf(stderr, "typio-engine: missing required modality operation\n");
         return false;
     }
 
@@ -225,6 +264,70 @@ static bool worker_init(Worker *worker) {
     }
     worker->base->initialized = true;
     return true;
+}
+
+static void write_schema_hello(FILE *out, const TypioConfigField *field) {
+    char default_value[64] = "";
+    switch (field->type) {
+    case TYPIO_FIELD_STRING:
+        break;
+    case TYPIO_FIELD_INT:
+        snprintf(default_value, sizeof(default_value), "%d", field->def.i);
+        break;
+    case TYPIO_FIELD_BOOL:
+        snprintf(default_value, sizeof(default_value), "%s",
+                 field->def.b ? "true" : "false");
+        break;
+    case TYPIO_FIELD_FLOAT:
+        snprintf(default_value, sizeof(default_value), "%.17g", field->def.f);
+        break;
+    }
+
+    fputs("\nSCHEMA\t", out);
+    write_hex_field(out, field->key);
+    fprintf(out, "\t%d\t", (int)field->type);
+    write_hex_field(out, field->type == TYPIO_FIELD_STRING
+                             ? field->def.s
+                             : default_value);
+    fputc('\t', out);
+    write_hex_field(out, field->ui_label);
+    fputc('\t', out);
+    write_hex_field(out, field->ui_section);
+    fprintf(out, "\t%d\t%d\t%d\t",
+            field->ui_min, field->ui_max, field->ui_step);
+    for (size_t i = 0; field->ui_options && field->ui_options[i]; i++) {
+        if (i) {
+            fputc(',', out);
+        }
+        write_hex_field(out, field->ui_options[i]);
+    }
+    fputc('\t', out);
+    write_hex_field(out, field->runtime_property);
+}
+
+static bool send_engine_hello(const Worker *worker, int protocol_fd) {
+    char *payload = NULL;
+    size_t payload_len = 0;
+    FILE *out = open_memstream(&payload, &payload_len);
+    if (!out) {
+        return false;
+    }
+    const char *engine_type =
+        worker->info->type == TYPIO_ENGINE_TYPE_KEYBOARD
+            ? "keyboard"
+            : "voice";
+    fprintf(out, "protocol\t1.0\nengine\t%s\ntype\t%s",
+            worker->info->name ? worker->info->name : "",
+            engine_type);
+    for (size_t i = 0; worker->schema && i < worker->schema_count; i++) {
+        write_schema_hello(out, &worker->schema[i]);
+    }
+    bool closed = fclose(out) == 0;
+    bool sent = closed &&
+        typio_engine_protocol_write_frame(protocol_fd,
+            TYPIO_ENGINE_PROTOCOL_ENGINE_HELLO, 0, payload, payload_len);
+    free(payload);
+    return sent;
 }
 
 /* Teardown runs active → deactivated → destroyed.
@@ -391,6 +494,44 @@ static void handle_get_active_mode(Worker *worker) {
     write_mode_line("ACTIVE_MODE", mode, true);
 }
 
+static void handle_list_commands(Worker *worker) {
+    if (!worker->base->surface || !worker->base->surface->list_commands) {
+        fputs("OK\n", stdout);
+        return;
+    }
+    size_t count = 0;
+    const TypioEngineCommand *commands =
+        worker->base->surface->list_commands(worker->base, &count);
+    for (size_t i = 0; commands && i < count; i++) {
+        write_command_line(&commands[i]);
+    }
+}
+
+static void handle_invoke_command(Worker *worker, char *save) {
+    const char *encoded_id = field_next(&save);
+    if (!worker->base->surface || !worker->base->surface->invoke_command) {
+        fputs("ERR\tNOT_SUPPORTED\n", stdout);
+        return;
+    }
+    char *id = decode_hex_string(encoded_id ? encoded_id : "");
+    if (!id || !*id) {
+        free(id);
+        fputs("ERR\tinvalid command id\n", stdout);
+        return;
+    }
+    TypioResult result = worker->base->surface->invoke_command(worker->base, id);
+    free(id);
+    if (result == TYPIO_OK) {
+        fputs("OK\n", stdout);
+    } else if (result == TYPIO_ERROR_NOT_FOUND) {
+        fputs("ERR\tNOT_FOUND\n", stdout);
+    } else if (result == TYPIO_ERROR_NOT_SUPPORTED) {
+        fputs("ERR\tNOT_SUPPORTED\n", stdout);
+    } else {
+        fprintf(stdout, "ERR\tinvoke_command failed: %d\n", result);
+    }
+}
+
 /* Append an ACTIVE_MODE line reporting the engine's current keyboard mode.
  *
  * A worker is host-driven and has no asynchronous channel, so the reply to any
@@ -506,6 +647,10 @@ static bool handle_request(Worker *worker, char *line) {
         handle_list_modes(worker);
     } else if (strcmp(op, "get-active-mode") == 0) {
         handle_get_active_mode(worker);
+    } else if (strcmp(op, "list-commands") == 0) {
+        handle_list_commands(worker);
+    } else if (strcmp(op, "invoke-command") == 0) {
+        handle_invoke_command(worker, save);
     } else if (strcmp(op, "set-active-mode") == 0) {
         handle_set_active_mode(worker, save);
         emit_active_mode(worker);
@@ -533,18 +678,12 @@ int main(void) {
         protocol_fd = (int)strtol(fd_env, NULL, 10);
     }
     typio_engine_response_out = stderr;
-    if (!worker_init(&worker)) {
+    if (!worker_prepare(&worker)) {
         worker_destroy(&worker);
         return 1;
     }
 
-    const char *engine_type =
-        (worker.info && worker.info->type == TYPIO_ENGINE_TYPE_KEYBOARD)
-            ? "keyboard"
-            : "voice";
-    if (!typio_engine_protocol_send_hello(protocol_fd,
-                                     worker.info ? worker.info->name : "engine",
-                                     engine_type)) {
+    if (!send_engine_hello(&worker, protocol_fd)) {
         worker_destroy(&worker);
         return 1;
     }
@@ -556,6 +695,10 @@ int main(void) {
         return 1;
     }
     typio_engine_protocol_frame_free(&host_hello);
+    if (!worker_start(&worker)) {
+        worker_destroy(&worker);
+        return 1;
+    }
 
     while (true) {
         TypioEngineProtocolFrame frame;

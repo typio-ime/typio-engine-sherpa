@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  SHERPA_ONNX_REF: 7fc2ea7725425d2df7516fdc17e6abe6bd9518d7
+  PKG_CONFIG_PATH: ${{ github.workspace }}/_typio/target/release:${{ runner.temp }}/sherpa
+  LD_LIBRARY_PATH: ${{ github.workspace }}/_typio/target/release:${{ runner.temp }}/sherpa/lib
+
+jobs:
+  build:
+    name: Build against pinned sherpa-onnx
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libcurl4-openssl-dev libssl-dev \
+            meson ninja-build pkg-config
+
+      - name: Checkout Typio
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/typio
+          path: _typio
+
+      - name: Checkout Optics manifests
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/optics
+          path: optics
+
+      - name: Build typio-core
+        run: cargo build --release -p typio-core --manifest-path _typio/Cargo.toml
+
+      - name: Checkout sherpa-onnx
+        uses: actions/checkout@v4
+        with:
+          repository: k2-fsa/sherpa-onnx
+          ref: ${{ env.SHERPA_ONNX_REF }}
+          path: _sherpa_onnx
+
+      - name: Build and install sherpa-onnx C API
+        run: |
+          cmake -S _sherpa_onnx -B _sherpa_onnx/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${{ runner.temp }}/sherpa" \
+            -DBUILD_SHARED_LIBS=ON \
+            -DSHERPA_ONNX_ENABLE_C_API=ON \
+            -DSHERPA_ONNX_ENABLE_BINARY=OFF \
+            -DSHERPA_ONNX_ENABLE_TESTS=OFF \
+            -DSHERPA_ONNX_ENABLE_CHECK=OFF \
+            -DSHERPA_ONNX_ENABLE_PORTAUDIO=OFF \
+            -DSHERPA_ONNX_ENABLE_WEBSOCKET=OFF \
+            -DSHERPA_ONNX_ENABLE_TTS=OFF \
+            -DSHERPA_ONNX_ENABLE_SPEAKER_DIARIZATION=OFF \
+            -DSHERPA_ONNX_BUILD_C_API_EXAMPLES=OFF
+          cmake --build _sherpa_onnx/build --target install --parallel 2
+
+      - name: Configure
+        run: meson setup build --prefix="$HOME/.local" --werror
+
+      - name: Build
+        run: meson compile -C build
+
+      - name: Verify install layout
+        run: |
+          stage="$RUNNER_TEMP/typio-engine-sherpa-stage"
+          meson install -C build --destdir "$stage"
+
+          prefix="$stage$HOME/.local"
+          test -x "$prefix/libexec/typio/engines/typio-engine-sherpa"
+          test -f "$prefix/share/typio/engines/typio-engine-sherpa.toml"
+          test -f "$prefix/share/icons/hicolor/scalable/apps/typio-sherpa-symbolic.svg"
