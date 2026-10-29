@@ -6,21 +6,35 @@ out-of-process worker: the host starts `typio-engine-sherpa` from the
 `typio-engine-sherpa.toml` manifest, feeds it microphone audio, and the engine
 returns recognized text.
 
-The engine auto-detects the model type (SenseVoice, Whisper, transducer, or
-Paraformer) from the files in your model directory, so the same build works
-across offline sherpa-onnx models.
+It recognises SenseVoice-family offline models (`model.int8.onnx` or
+`model.onnx` plus `tokens.txt`). A model directory holding exactly one such
+model is resolved automatically; an ambiguous base directory is rejected rather
+than guessed at.
+
+The engine is a plain Cargo build. There is no `meson`, no `libtypio` linkage,
+and no in-process ABI — see Typio's ADR-0054 for why that boundary is the only
+one supported.
 
 ## Quick start
 
 ```sh
-meson setup build
-ninja -C build
-meson install -C build
+cargo build --release
 ```
 
-This installs the worker, manifest, and icons. The host discovers it on next start —
-no host rebuild or registration needed. See [docs/dev/setup.md](docs/dev/setup.md)
-for prerequisites, staging prefixes, and editor setup.
+Prerequisites: `pkg-config`, `libclang` (for `bindgen`), and the sherpa-onnx C
+API installed so that `pkg-config --exists sherpa-onnx` succeeds and
+`<prefix>/include/sherpa-onnx/c-api/c-api.h` is present. See
+[docs/dev/setup.md](docs/dev/setup.md).
+
+You can then check the engine against Typio's black-box conformance gate:
+
+```sh
+typio-engine-check ./typio-engine-sherpa.toml
+```
+
+`cargo test --no-default-features` runs the model-discovery, wire-decoding, and
+availability-policy tests with **no** native library present, so it works on any
+machine.
 
 Then install a model so the engine has something to load:
 

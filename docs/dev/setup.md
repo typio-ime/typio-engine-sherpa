@@ -1,75 +1,97 @@
-# Development Setup
+# Development setup
 
 ## Prerequisites
 
-| Dependency        | Provides                    | Notes                           |
-| ----------------- | --------------------------- | ------------------------------- |
-| Meson `>= 1.0.0`  | Build system                | Requires `c_std=c23`.           |
-| Ninja             | Build backend               |                                 |
-| C23 compiler      | Compilation                 | GCC 13+ or Clang 16+.           |
-| `typio-engine-abi` | Engine ABI headers + pc    | From the Typio workspace.      |
-| `sherpa-onnx`     | STT runtime                 | Falls back to `LIBRARY_PATH`.   |
+| Requirement | Why |
+| :--- | :--- |
+| Rust 1.85+ (edition 2024) | Builds the engine. |
+| `pkg-config` | Resolves the sherpa-onnx C API. |
+| `libclang` | `bindgen` generates the FFI bindings from the sherpa-onnx header. |
+| sherpa-onnx C API | Provides `sherpa-onnx.pc` and `sherpa-onnx/c-api/c-api.h`. |
+
+Verify the native prerequisites:
+
+```sh
+pkg-config --exists sherpa-onnx && echo ok
+pkg-config --modversion sherpa-onnx
+```
 
 ## Build
 
 ```sh
-meson setup build
-ninja -C build
+cargo build --release
 ```
 
-## Development Run
+This produces `target/release/typio-engine-sherpa`, the path the manifest names.
 
-With a release build of the Typio workspace:
+## Test
+
+Two configurations, both meaningful:
 
 ```sh
-LD_LIBRARY_PATH=/path/to/typio/target/release \
-  /path/to/typio/target/release/typio --verbose \
-  --engine-dir "$PWD/build"
+# Pure logic: model discovery, wire decoding, availability policy.
+# Needs no sherpa-onnx and no libclang. This is the portable gate.
+cargo test --no-default-features
+
+# The shipped configuration. Links sherpa-onnx; requires it at runtime.
+cargo test
 ```
 
-The build directory contains `typio-engine-sherpa` and its development
-manifest. The manifest starts `./typio-engine-sherpa` relative to that
-directory.
+`--no-default-features` is the only configuration that runs on a machine without
+the native library, which is why the pure logic lives in `src/model.rs` with no
+FFI at all.
 
-<details>
-<summary>Using a local libtypio build</summary>
+## Conformance
 
-Adjust `/path/to/typio` for your checkout.
+Typio's engine gate is black-box and lives in the host repository:
 
 ```sh
-cargo build --release -p typio-core --manifest-path /path/to/typio/Cargo.toml
-export PKG_CONFIG_PATH="/path/to/typio/target/release${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-meson setup --wipe build
-ninja -C build
+typio-engine-check ./typio-engine-sherpa.toml
 ```
 
-</details>
+It starts the engine in an isolated process, performs the handshake, and — for an
+engine that declares `voice_input` — sends real non-silent audio and requires a
+non-empty transcript. A stub that returns empty text fails.
 
-## Rebuild
+## sherpa-onnx from source
+
+If your distribution ships no sherpa-onnx package, build the C API from a pinned
+revision and point the sys crate at it:
 
 ```sh
-ninja -C build
+git clone https://github.com/k2-fsa/sherpa-onnx
+cd sherpa-onnx
+git checkout 7fc2ea7725425d2df7516fdc17e6abe6bd9518d7
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$HOME/.local" \
+  -DBUILD_SHARED_LIBS=ON -DSHERPA_ONNX_ENABLE_C_API=ON
+cmake --build build --target install
 ```
 
-Reconfigure when changing build options or dependency layout:
+Then export `PKG_CONFIG_PATH="$HOME/.local/lib/pkgconfig"` and, if the prefix is
+outside the loader's default search path, `LD_LIBRARY_PATH="$HOME/.local/lib"`.
+The sys crate bakes an rpath for non-system prefixes, so a normal prefix needs
+neither.
+
+## Overriding discovery
+
+The `sherpa-onnx-sys` build script honours these when `pkg-config` is not usable:
+
+| Variable | Effect |
+| :--- | :--- |
+| `SHERPA_ONNX_SYS_USE_PKG_CONFIG=0` | Skip the probe; link manually. |
+| `SHERPA_ONNX_SYS_INCLUDE_DIR` | Colon-separated extra include directories. |
+| `SHERPA_ONNX_SYS_LIB_DIR` | Colon-separated extra library directories. |
+| `SHERPA_ONNX_SYS_STATIC=1` | Link statically. |
+
+## Model
+
+Install a model, then confirm the layout the engine expects:
 
 ```sh
-meson setup --reconfigure build
+~/.local/share/typio/sherpa-onnx/<model-name>/
+    model.int8.onnx
+    tokens.txt
 ```
 
-See [How to Install a Speech Model](../how-to/install-a-model.md) for runtime
-model setup. Production installation belongs in distribution packaging.
-
-## Models
-
-The worker discovers a model at focus-in under
-`<instance-data-dir>/sherpa-onnx/`. Place a single model directory there; type
-(SenseVoice, Whisper, transducer, Paraformer) is auto-detected from the files
-present. Override with `engines.sherpa-onnx.model` and
-`engines.sherpa-onnx.language`.
-
-## Editor / LSP
-
-```sh
-ln -sf build/compile_commands.json compile_commands.json
-```
+Use [How to install a speech model](../how-to/install-a-model.md).

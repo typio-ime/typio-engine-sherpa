@@ -1,0 +1,143 @@
+//! Build script for `sherpa-onnx-sys`.
+//!
+//! Strategy (mirrors the `flux-sys` / `openssl-sys` convention):
+//!
+//!   1. Locate sherpa-onnx through `pkg-config`, which yields the include path
+//!      and link flags for the C API library.
+//!   2. Generate bindings with `bindgen` against
+//!      `<sherpa-onnx/c-api/c-api.h>`, restricted to an explicit allowlist.
+//!   3. Emit an rpath for a non-system prefix so the loader finds the library
+//!      without `LD_LIBRARY_PATH`.
+//!
+//! The allowlist is the contract. sherpa-onnx's header is ~4700 lines and
+//! carries a dozen model families; the recognizer needs five functions and four
+//! structs. Binding only those means an upstream rename breaks the build at a
+//! short declaration block instead of surfacing as an undefined symbol at
+//! runtime, and it keeps the generated bindings readable.
+//!
+//! Override points (env):
+//!   SHERPA_ONNX_SYS_USE_PKG_CONFIG=0   skip the probe and link manually
+//!   SHERPA_ONNX_SYS_INCLUDE_DIR=<dirs> colon-separated extra include dirs
+//!   SHERPA_ONNX_SYS_LIB_DIR=<dirs>     colon-separated extra library dirs
+//!   SHERPA_ONNX_SYS_STATIC=1           link statically
+
+use std::env;
+use std::path::PathBuf;
+
+/// The exact C surface this crate exposes.
+///
+/// Every entry is reached from `src/sherpa.rs`. Adding a model family means
+/// extending this list first, which is the intended review checkpoint.
+const ALLOWED_TYPES: &[&str] = &[
+    "SherpaOnnxFeatureConfig",
+    "SherpaOnnxOfflineSenseVoiceModelConfig",
+    "SherpaOnnxOfflineModelConfig",
+    "SherpaOnnxOfflineRecognizerConfig",
+    "SherpaOnnxOfflineRecognizerResult",
+    "SherpaOnnxOfflineRecognizer",
+    "SherpaOnnxOfflineStream",
+];
+
+const ALLOWED_FUNCTIONS: &[&str] = &[
+    "SherpaOnnxCreateOfflineRecognizer",
+    "SherpaOnnxDestroyOfflineRecognizer",
+    "SherpaOnnxCreateOfflineStream",
+    "SherpaOnnxDestroyOfflineStream",
+    "SherpaOnnxAcceptWaveformOffline",
+    "SherpaOnnxDecodeOfflineStream",
+    "SherpaOnnxGetOfflineStreamResult",
+    "SherpaOnnxDestroyOfflineRecognizerResult",
+];
+
+fn main() {
+    println!("cargo:rerun-if-changed=wrapper.h");
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=SHERPA_ONNX_SYS_USE_PKG_CONFIG");
+    println!("cargo:rerun-if-env-changed=SHERPA_ONNX_SYS_INCLUDE_DIR");
+    println!("cargo:rerun-if-env-changed=SHERPA_ONNX_SYS_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=SHERPA_ONNX_SYS_STATIC");
+
+    let mut include_paths: Vec<PathBuf> = Vec::new();
+    let mut lib_paths: Vec<String> = Vec::new();
+    let static_link = env::var("SHERPA_ONNX_SYS_STATIC").as_deref() == Ok("1");
+    let use_pkg_config = env::var("SHERPA_ONNX_SYS_USE_PKG_CONFIG").as_deref() != Ok("0");
+
+    if use_pkg_config {
+        let library = pkg_config::Config::new()
+            .print_system_libs(false)
+            .probe("sherpa-onnx")
+            .unwrap_or_else(|error| {
+                panic!(
+                    "pkg-config could not find sherpa-onnx: {error}\n\
+                     Install the sherpa-onnx C API (the header must be at \
+                     <prefix>/include/sherpa-onnx/c-api/c-api.h and a sherpa-onnx.pc \
+                     must be on PKG_CONFIG_PATH), or set \
+                     SHERPA_ONNX_SYS_USE_PKG_CONFIG=0 with \
+                     SHERPA_ONNX_SYS_INCLUDE_DIR and SHERPA_ONNX_SYS_LIB_DIR."
+                );
+            });
+        include_paths.extend(library.include_paths.iter().cloned());
+        lib_paths.extend(library.link_paths.iter().map(|path| path.display().to_string()));
+    }
+
+    if let Ok(value) = env::var("SHERPA_ONNX_SYS_INCLUDE_DIR") {
+        for part in value.split(':').filter(|part| !part.is_empty()) {
+            include_paths.push(PathBuf::from(part));
+        }
+    }
+    if let Ok(value) = env::var("SHERPA_ONNX_SYS_LIB_DIR") {
+        for part in value.split(':').filter(|part| !part.is_empty()) {
+            println!("cargo:rustc-link-search=native={part}");
+            lib_paths.push(part.to_string());
+        }
+    }
+
+    if !use_pkg_config {
+        let kind = if static_link { "static" } else { "dylib" };
+        println!("cargo:rustc-link-lib={kind}=sherpa-onnx-c-api");
+        println!("cargo:rustc-link-lib={kind}=sherpa-onnx-cxx-api");
+    }
+    if static_link {
+        // The C API is C++ underneath.
+        println!("cargo:rustc-link-lib=stdc++");
+    }
+
+    // Allowlist the *offline* surface only. A blanket `SherpaOnnx.*` would also
+    // pull in the online (streaming) recognizer, which this engine never uses and
+    // which doubles the generated surface.
+    let mut builder = bindgen::Builder::default()
+        .header("wrapper.h")
+        .allowlist_type("SherpaOnnx(Online|Feature).*")
+        .blocklist_type("SherpaOnnx(Online|Tone|Tdnn|Keyword|Vad).*")
+        .blocklist_function("SherpaOnnx.*Online.*")
+        .blocklist_function("SherpaOnnx(Get(C|Git|Onnx)|FileExists).*")
+        .raw_line("// Generated by sherpa-onnx-sys/build.rs. Do not edit.")
+        .layout_tests(false)
+        .derive_default(false)
+        .generate_comments(false);
+    for ty in ALLOWED_TYPES {
+        builder = builder.allowlist_type(ty);
+    }
+    for func in ALLOWED_FUNCTIONS {
+        builder = builder.allowlist_function(func);
+    }
+    for path in &include_paths {
+        builder = builder.clang_arg(format!("-I{}", path.display()));
+    }
+
+    let bindings = builder.generate().unwrap_or_else(|error| {
+        panic!("bindgen failed to generate sherpa-onnx bindings: {error}\ninclude paths: {include_paths:?}")
+    });
+    let out_path = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("bindings.rs");
+    bindings
+        .write_to_file(&out_path)
+        .unwrap_or_else(|error| panic!("failed to write {}: {error}", out_path.display()));
+
+    // Bake an rpath for non-system prefixes so the loader needs no env var.
+    let system_dirs = ["/usr/lib", "/usr/lib64", "/lib", "/lib64", "/usr/local/lib"];
+    for dir in &lib_paths {
+        if !system_dirs.contains(&dir.as_str()) {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
+        }
+    }
+}

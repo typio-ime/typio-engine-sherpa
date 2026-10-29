@@ -1,5 +1,68 @@
 # Changelog
 
+## v0.4.0 - 2026-10-29
+
+### Breaking
+
+- **The legacy in-process C ABI implementation is gone.** `src/sherpa.c`,
+  `src/worker_main.c`, `meson.build`, and `typio-engine-sherpa.toml.in` are
+  deleted. They could not build: `meson` demanded `typio-engine-abi`, a
+  pkg-config module that no longer exists now that Typio's runtime boundary is
+  the Engine Protocol process channel. See Typio ADR-0054.
+
+- **The build is Cargo-only.** `cargo build --release` produces the engine.
+  sherpa-onnx is discovered through `pkg-config` and bound by the in-tree
+  `sherpa-onnx-sys` crate. There is no `meson`, no `libtypio`, and no
+  `libcurl`/`libcrypto` dependency on the recogniser path.
+
+### Fixed
+
+- **Voice input now actually transcribes.** The previous `process_audio` returned
+  the empty string unconditionally — for any input, including loud audio — while
+  reporting `Availability::Ready`. Measured: 1.5 s of audio at peak amplitude 0.60
+  produced `Text("")`. The engine now runs sherpa-onnx offline recognition and
+  returns the transcript (verified: `"Yeah."` for a generated tone).
+
+- **`Availability` is honest.** `Ready` is reported only when a model directory
+  actually resolves. A missing or unloadable model reports `Failed`, and every
+  inference failure returns `ReplyRecord::Error`. The `Ready` + `Text("")`
+  combination is now unreachable.
+
+- **Silence and undecodable audio are errors, not empty successes.** A payload
+  below the noise floor, a payload that is not a multiple of the 4-byte sample
+  width, and non-finite samples each produce a specific error message.
+
+- **Model discovery matches the installer's layout.** The engine resolves
+  `<data-dir>/sherpa-onnx/<model-name>/`, which is where
+  `scripts/install-sensevoice-model.sh` places a model. The previous code looked
+  only at `<data-dir>/sherpa-onnx/` and never descended into the model
+  subdirectory. A base directory offering more than one candidate model is
+  rejected rather than guessed at.
+
+- **`ReloadConfig` drops the loaded recognizer**, so a changed model path or
+  language takes effect instead of being silently ignored.
+
+### Added
+
+- **`sherpa-onnx-sys`**: a minimal FFI crate binding exactly eight functions and
+  seven types from the sherpa-onnx C API. The allowlist is the contract: an
+  upstream rename fails the build at a short declaration block instead of
+  surfacing as an undefined symbol at runtime.
+
+- **A `native` feature (default on)** so the pure logic — model discovery, wire
+  decoding, availability policy — compiles and tests with no native library
+  present. `cargo test --no-default-features` is the portable gate.
+
+- **15 unit tests** covering model-layout resolution (direct, nested, int8
+  preference, float fallback, ambiguity rejection, unrelated directories),
+  wire decoding (empty, unaligned, endianness), and the availability/silence
+  policies. All pass without sherpa-onnx installed.
+
+- **CI split into a pure gate and a native gate.** The native gate installs a
+  real model and requires `typio-engine-check` to observe a non-empty
+  transcript, because the recorded defect was a green conformance run over a
+  stub.
+
 ## Unreleased
 
 - **Pinned upstream compatibility CI.** The production build now compiles the

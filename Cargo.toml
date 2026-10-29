@@ -1,0 +1,29 @@
+[package]
+name = "typio-engine-sherpa"
+version = "0.4.0"
+description = "Sherpa-ONNX speech-to-text engine for Typio"
+edition = "2024"
+authors = ["Typio Contributors"]
+license = "MIT"
+
+[features]
+# `native` links the sherpa-onnx C API and enables real recognition. It is on by
+# default because the shipped binary must transcribe.
+#
+# Turning it off builds the engine with recognition unavailable and, more
+# importantly, makes every piece of pure logic — model-layout discovery, wire
+# decoding, availability policy — testable on a machine with no sherpa-onnx
+# installed. `cargo test --no-default-features` is the portable gate.
+default = ["native"]
+native = ["dep:sherpa-onnx-sys"]
+
+[dependencies]
+typio-engine-protocol = { path = "../../typio/crates/typio-engine-protocol" }
+sherpa-onnx-sys = { path = "sherpa-onnx-sys", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "typio-engine-sherpa"
+path = "src/main.rs"

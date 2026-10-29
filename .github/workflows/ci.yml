@@ -12,13 +12,35 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned sherpa-onnx revision. The sys crate's allowlist is the contract; when
+  # this moves, re-check that every name in sherpa-onnx-sys/build.rs still exists.
   SHERPA_ONNX_REF: 7fc2ea7725425d2df7516fdc17e6abe6bd9518d7
-  PKG_CONFIG_PATH: ${{ github.workspace }}/_typio/target/release:${{ runner.temp }}/sherpa
-  LD_LIBRARY_PATH: ${{ github.workspace }}/_typio/target/release:${{ runner.temp }}/sherpa/lib
+  PKG_CONFIG_PATH: ${{ runner.temp }}/sherpa/lib/pkgconfig
+  LD_LIBRARY_PATH: ${{ runner.temp }}/sherpa/lib
 
 jobs:
-  build:
-    name: Build against pinned sherpa-onnx
+  # The pure-logic gate. No sherpa-onnx, no bindgen, no native library: this is
+  # what must pass on any contributor machine and is the fastest signal that
+  # model discovery, wire decoding, and availability policy are intact.
+  pure:
+    name: Pure logic (no native library)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Format
+        run: cargo fmt -- --check
+
+      - name: Test without the native backend
+        run: cargo test --no-default-features
+
+      - name: Lint without the native backend
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+
+  # The shipped configuration: links the pinned sherpa-onnx C API and proves the
+  # engine actually transcribes through Typio's black-box conformance gate.
+  native:
+    name: Native build against pinned sherpa-onnx
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -27,23 +49,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake libcurl4-openssl-dev libssl-dev \
-            meson ninja-build pkg-config
+            build-essential cmake pkg-config libclang-dev
 
       - name: Checkout Typio
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/typio
           path: _typio
-
-      - name: Checkout Optics manifests
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/optics
-          path: optics
-
-      - name: Build typio-core
-        run: cargo build --release -p typio-core --manifest-path _typio/Cargo.toml
 
       - name: Checkout sherpa-onnx
         uses: actions/checkout@v4
@@ -52,7 +64,7 @@ jobs:
           ref: ${{ env.SHERPA_ONNX_REF }}
           path: _sherpa_onnx
 
-      - name: Build and install sherpa-onnx C API
+      - name: Build and install the sherpa-onnx C API
         run: |
           cmake -S _sherpa_onnx -B _sherpa_onnx/build \
             -DCMAKE_BUILD_TYPE=Release \
@@ -69,18 +81,34 @@ jobs:
             -DSHERPA_ONNX_BUILD_C_API_EXAMPLES=OFF
           cmake --build _sherpa_onnx/build --target install --parallel 2
 
-      - name: Configure
-        run: meson setup build --prefix="$HOME/.local" --werror
+      - name: Build the engine
+        run: cargo build --release
 
-      - name: Build
-        run: meson compile -C build
+      - name: Lint the shipped configuration
+        run: cargo clippy --all-targets -- -D warnings
 
-      - name: Verify install layout
+      # The recorded defect was a green conformance gate over a stub. The gate is
+      # black-box and lives in the host repo, so it is the authority here.
+      - name: Build the conformance checker
+        run: cargo build --release -p typio-engine-check --manifest-path _typio/Cargo.toml
+
+      - name: Install a model and prove the engine transcribes
         run: |
-          stage="$RUNNER_TEMP/typio-engine-sherpa-stage"
-          meson install -C build --destdir "$stage"
+          ./scripts/install-sensevoice-model.sh -d "${{ runner.temp }}/data/typio/sherpa-onnx"
+          XDG_DATA_HOME="${{ runner.temp }}/data" \
+            ./_typio/target/release/typio-engine-check ./typio-engine-sherpa.toml \
+              --only protocol,behavior
 
-          prefix="$stage$HOME/.local"
-          test -x "$prefix/libexec/typio/engines/typio-engine-sherpa"
-          test -f "$prefix/share/typio/engines/typio-engine-sherpa.toml"
-          test -f "$prefix/share/icons/hicolor/scalable/apps/typio-sherpa-symbolic.svg"
+  install-layout:
+    name: Installed layout
+    runs-on: ubuntu-24.04
+    needs: native
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the packaged resources exist
+        run: |
+          test -f typio-engine-sherpa.toml
+          test -f data/icons/hicolor/scalable/apps/typio-sherpa-symbolic.svg
+          # The manifest must point at a Cargo-built binary, not a meson target.
+          grep -q '^command = "./target/release/typio-engine-sherpa"$' typio-engine-sherpa.toml

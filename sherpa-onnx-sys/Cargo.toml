@@ -1,0 +1,14 @@
+[package]
+name = "sherpa-onnx-sys"
+version = "0.1.0"
+description = "Minimal FFI bindings to the sherpa-onnx offline recognizer C API"
+edition = "2024"
+license = "MIT"
+links = "sherpa-onnx"
+publish = false
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.72"
+pkg-config = "0.3"
