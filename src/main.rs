@@ -18,6 +18,7 @@
 //!   probes availability; the first `ProcessAudio` pays the 239 MB load. This
 //!   keeps handshake latency at milliseconds and keeps the probe cheap.
 
+mod config;
 mod model;
 
 #[cfg(feature = "native")]
@@ -32,6 +33,7 @@ use typio_engine_protocol::{
     Reply, ReplyRecord, Request, SchemaDefault, SchemaField, read_frame, write_frame,
 };
 
+use config::EngineConfig;
 use model::ModelFiles;
 
 /// The recogniser backend.
@@ -78,9 +80,9 @@ impl LoadBackend for Backend {
 /// Engine identifier reported in `ENGINE_HELLO` and the manifest.
 const ENGINE_NAME: &str = "sherpa-onnx";
 
-/// Configuration key for the model directory.
+/// Schema keys are the fully-qualified form the host displays.
 const MODEL_KEY: &str = "engines.sherpa-onnx.model";
-/// Configuration key for the recognition language hint.
+/// Recognition language hint.
 const LANGUAGE_KEY: &str = "engines.sherpa-onnx.language";
 
 /// Languages SenseVoice supports. `"auto"` lets the model decide.
@@ -118,12 +120,12 @@ fn schema() -> Vec<SchemaField> {
 /// Engine state across the protocol loop.
 #[derive(Default)]
 struct Engine {
-    /// Configured model directory, relative paths resolved against `data_dir`.
-    model_setting: Option<String>,
-    /// Language hint; empty means let the model auto-detect.
-    language: String,
-    /// Host-provided data directory, used to resolve relative model paths.
+    /// Host config directory, holding the host-owned `core.toml`.
+    config_dir: PathBuf,
+    /// Host data directory, used to resolve relative model paths.
     data_dir: PathBuf,
+    /// Configuration read from `core.toml` on load and after `ReloadConfig`.
+    config: EngineConfig,
     /// Loaded recognizer, if one is resident.
     recognizer: Option<Backend>,
     /// Why the last load attempt failed, so `Availability` can explain itself.
@@ -139,12 +141,7 @@ impl Engine {
     /// `<data_dir>/sherpa-onnx` so a stock install works with no configuration.
     fn resolve_model_dir(&self) -> PathBuf {
         let base = self.data_dir.join("sherpa-onnx");
-        match self
-            .model_setting
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+        match self.config.model.as_deref() {
             Some(setting) => {
                 let path = PathBuf::from(setting);
                 if path.is_absolute() {
@@ -175,11 +172,7 @@ impl Engine {
             return Err(error.clone());
         }
         let dir = self.resolve_model_dir();
-        let language = if self.language.trim().is_empty() {
-            "auto"
-        } else {
-            self.language.trim()
-        };
+        let language = self.config.language.as_deref().unwrap_or("auto");
         match ModelFiles::discover(&dir) {
             Ok(files) => match Backend::load(&files, language) {
                 Ok(backend) => {
@@ -205,6 +198,29 @@ impl Engine {
                 Err(error)
             }
         }
+    }
+
+    /// Re-read `core.toml` and drop the resident recognizer.
+    ///
+    /// Called on `ReloadConfig`. A read failure keeps the previous configuration
+    /// rather than replacing it with defaults, so a transient I/O error cannot
+    /// silently change which model the user is transcribing with.
+    ///
+    /// # Errors
+    /// Returns a message when `core.toml` exists but cannot be read or parsed, or
+    /// when one of this engine's keys holds a non-string value.
+    fn reload_config(&mut self) -> Result<(), String> {
+        let config = EngineConfig::read(&self.config_dir, ENGINE_NAME)?;
+        if config != self.config {
+            log(&format!(
+                "config reloaded (model={:?}, language={:?})",
+                config.model, config.language
+            ));
+        }
+        self.config = config;
+        self.recognizer = None;
+        self.load_error = None;
+        Ok(())
     }
 
     /// Report availability without forcing a model load.
@@ -318,9 +334,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host_hello = HostHello::decode(&host_frame.payload)?;
 
     let mut engine = Engine {
+        config_dir: PathBuf::from(&host_hello.config_dir),
         data_dir: PathBuf::from(&host_hello.data_dir),
         ..Engine::default()
     };
+    // Read the host's `core.toml` before the first request. A failure is logged
+    // and reported through `Availability`, not treated as fatal: the engine still
+    // speaks the protocol and can serve `ReloadConfig` once the file is fixed.
+    if let Err(error) = engine.reload_config() {
+        log(&format!("configuration unavailable: {error}"));
+        engine.load_error = Some(error);
+    }
 
     // Host closed the channel: normal teardown.
     while let Ok(frame) = read_frame(&mut channel) {
@@ -369,11 +393,13 @@ fn handle(engine: &mut Engine, request: Request) -> Vec<ReplyRecord> {
         },
         // A configuration change may name a different model or language, so drop
         // the loaded recognizer and let the next use rebuild it.
-        Request::ReloadConfig => {
-            engine.recognizer = None;
-            engine.load_error = None;
-            vec![ReplyRecord::Ok]
-        }
+        Request::ReloadConfig => match engine.reload_config() {
+            Ok(()) => vec![ReplyRecord::Ok],
+            Err(error) => {
+                log(&format!("configuration reload failed: {error}"));
+                vec![ReplyRecord::Error(error)]
+            }
+        },
         Request::FocusIn(_)
         | Request::FocusOut(_)
         | Request::Reset(_)
