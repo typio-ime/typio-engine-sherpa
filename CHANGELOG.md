@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.4.0 - 2026-10-29
+## v0.5.0 - 2026-10-29
 
 ### Breaking
 
@@ -39,8 +39,21 @@
   subdirectory. A base directory offering more than one candidate model is
   rejected rather than guessed at.
 
+- **The engine now reads its own configuration from the host's `core.toml`.**
+  Neither documented key was consulted before: `Engine` carried `model_setting`
+  and `language` fields that nothing ever assigned, so `engines.sherpa-onnx.model`
+  and `.language` were accepted by the schema, displayed in the settings UI,
+  persisted across reloads, and ignored. A pinned model directory got
+  auto-detection, and `language = "zh"` got `auto`. Configuration is now read at
+  startup and on `ReloadConfig`, through document-level access so every host key
+  outside `engines.<name>` is tolerated. A missing file, section, or key keeps
+  the documented default; a wrong-typed value is an error rather than a silent
+  fallback, because ignoring `model = 3` would transcribe with a model the user
+  did not choose.
+
 - **`ReloadConfig` drops the loaded recognizer**, so a changed model path or
-  language takes effect instead of being silently ignored.
+  language takes effect instead of being silently ignored, and a read failure
+  keeps the previous configuration rather than replacing it with defaults.
 
 ### Added
 
@@ -53,39 +66,27 @@
   decoding, availability policy — compiles and tests with no native library
   present. `cargo test --no-default-features` is the portable gate.
 
-- **15 unit tests** covering model-layout resolution (direct, nested, int8
+- **23 unit tests** covering model-layout resolution (direct, nested, int8
   preference, float fallback, ambiguity rejection, unrelated directories),
-  wire decoding (empty, unaligned, endianness), and the availability/silence
-  policies. All pass without sherpa-onnx installed.
+  wire decoding (empty, unaligned, endianness), the availability/silence
+  policies, and `core.toml` parsing. All pass without sherpa-onnx installed.
 
 - **CI split into a pure gate and a native gate.** The native gate installs a
   real model and requires `typio-engine-check` to observe a non-empty
   transcript, because the recorded defect was a green conformance run over a
   stub.
 
-## Unreleased
+### Known limitations
 
-- **Pinned upstream compatibility CI.** The production build now compiles the
-  worker with warnings as errors against a fixed sherpa-onnx C API revision
-  and verifies its installed worker, manifest, and icon layout.
-- **ABI compatibility gate.** The worker validates the engine's exported ABI
-  version before reading schema metadata or constructing model state.
-- **Schema-first worker handshake.** The shared worker publishes Sherpa's
-  config schema before model construction, tolerates host discovery probes
-  that close before HostHello, and validates the required voice operation.
-- **Setup command is reachable and safe across worker shutdown.** Typio Engine
-  Protocol now exposes the engine's `setup` command. The background installer
-  is single-flight, cancellable, and joined during teardown, preventing its
-  engine pointer from outliving `SherpaState` or delaying shutdown for the
-  full network timeout. A completed setup is loaded during the next
-  availability check, while later workers find it through normal model
-  auto-detection.
-- **Model installation rejects truncated paths and unsafe extraction state.**
-  Path joins now fail explicitly instead of using truncated buffers, downloads
-  handle partial writes, use HTTPS-only redirects and bounded transfer
-  timeouts, and verify the pinned release asset's SHA-256 digest. Archives
-  extract into a private temporary directory, and incomplete model directories
-  are repaired instead of treated as installed.
+- **The `setup` command is not implemented.** `Request::InvokeCommand` returns a
+  bare `Ok` without doing anything, so a host asking this engine to install a
+  model gets a success reply and no installation. Model acquisition is
+  documented as manual: `scripts/install-sensevoice-model.sh`, or any directory
+  containing `model.int8.onnx` (or `model.onnx`) plus `tokens.txt`. An earlier
+  `Unreleased` section in this file advertised a background installer with
+  SHA-256 verification, bounded redirects, and atomic extraction; those entries
+  described the deleted C worker and were removed here because none of that code
+  exists in this tree.
 
 ## v0.2.2 - 2026-06-23
 
