@@ -345,7 +345,7 @@ version = "0.1.0"
 
 [[package]]
 name = "typio-engine-sherpa"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "libc",
  "sherpa-onnx-sys",
