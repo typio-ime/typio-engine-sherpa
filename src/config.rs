@@ -27,14 +27,31 @@ use std::path::Path;
 pub const MODEL_KEY: &str = "model";
 /// Recognition language hint.
 pub const LANGUAGE_KEY: &str = "language";
+/// Idle timeout in seconds before unloading the model (0 = disable eviction).
+pub const IDLE_TIMEOUT_KEY: &str = "idle_timeout_seconds";
+
+/// Default idle eviction threshold: 30 minutes (1800 seconds).
+pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 1800;
 
 /// Values read from `engines.<name>.*`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
     /// Explicit model directory, or `None` to auto-detect.
     pub model: Option<String>,
     /// Language hint, or `None` to let the model decide.
     pub language: Option<String>,
+    /// Idle timeout in seconds before unloading the resident model (0 = disable).
+    pub idle_timeout_seconds: u64,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            language: None,
+            idle_timeout_seconds: DEFAULT_IDLE_TIMEOUT_SECONDS,
+        }
+    }
 }
 
 impl EngineConfig {
@@ -78,8 +95,29 @@ impl EngineConfig {
         Ok(Self {
             model: string_value(section, MODEL_KEY)?,
             language: string_value(section, LANGUAGE_KEY)?,
+            idle_timeout_seconds: integer_value(section, IDLE_TIMEOUT_KEY)?
+                .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECONDS),
         })
     }
+}
+
+/// Read one non-negative integer field, tolerating absence and rejecting other types.
+fn integer_value(section: &toml_edit::Item, key: &str) -> Result<Option<u64>, String> {
+    let Some(item) = section.get(key) else {
+        return Ok(None);
+    };
+    let value = item.as_integer().ok_or_else(|| {
+        format!(
+            "`engines.*.{key}` must be an integer, found {}",
+            item.type_name()
+        )
+    })?;
+    if value < 0 {
+        return Err(format!(
+            "`engines.*.{key}` must not be negative, found {value}"
+        ));
+    }
+    Ok(Some(value as u64))
 }
 
 /// Read one string field, tolerating absence and rejecting other types.
@@ -125,6 +163,33 @@ mod tests {
             .expect("parse");
         assert_eq!(config.model.as_deref(), Some("sense-voice"));
         assert_eq!(config.language.as_deref(), Some("zh"));
+        assert_eq!(config.idle_timeout_seconds, DEFAULT_IDLE_TIMEOUT_SECONDS);
+    }
+
+    #[test]
+    fn reads_custom_idle_timeout_seconds() {
+        let config = parse("[engines.sherpa-onnx]\nidle_timeout_seconds = 600\n").expect("parse");
+        assert_eq!(config.idle_timeout_seconds, 600);
+    }
+
+    #[test]
+    fn idle_timeout_zero_is_accepted() {
+        let config = parse("[engines.sherpa-onnx]\nidle_timeout_seconds = 0\n").expect("parse");
+        assert_eq!(config.idle_timeout_seconds, 0);
+    }
+
+    #[test]
+    fn rejects_non_integer_idle_timeout() {
+        let error = parse("[engines.sherpa-onnx]\nidle_timeout_seconds = \"short\"\n")
+            .expect_err("must reject");
+        assert!(error.contains("must be an integer"), "{error}");
+    }
+
+    #[test]
+    fn rejects_negative_idle_timeout() {
+        let error =
+            parse("[engines.sherpa-onnx]\nidle_timeout_seconds = -10\n").expect_err("must reject");
+        assert!(error.contains("must not be negative"), "{error}");
     }
 
     #[test]

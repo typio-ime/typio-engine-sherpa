@@ -36,7 +36,14 @@ typio-engine-check ./typio-engine-sherpa.toml
 availability-policy tests with **no** native library present, so it works on any
 machine.
 
-Then install a model so the engine has something to load:
+Then install a model so the engine has something to load. You can provision
+the default SenseVoice model automatically using the Typio control client:
+
+```sh
+typioctl engine sherpa-onnx:setup
+```
+
+Or install manually or via script:
 
 - [How to install a speech model](docs/how-to/install-a-model.md)
 
@@ -50,6 +57,7 @@ reference, including the model-detection rules and fixed runtime parameters.
 | --- | --- |
 | `engines.sherpa-onnx.model` | Pin a specific model subdirectory (default: auto-detect). |
 | `engines.sherpa-onnx.language` | Recognition language hint (default: model-dependent). |
+| `engines.sherpa-onnx.idle_timeout_seconds` | Model memory eviction timeout (default: 1800s / 30m; 0 disables). |
 
 ## License
 

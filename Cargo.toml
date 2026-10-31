@@ -18,15 +18,13 @@ default = ["native"]
 native = ["dep:sherpa-onnx-sys"]
 
 [dependencies]
+libc = "0.2"
+tempfile = "3"
+toml_edit = "0.22"
 typio-engine-protocol = { path = "../../typio/crates/typio-engine-protocol" }
 sherpa-onnx-sys = { path = "sherpa-onnx-sys", optional = true }
-# Reads the host's `core.toml`. Document-level access is used rather than
-# deserialisation: the engine consumes exactly two keys and must tolerate every
-# other key in the host's configuration tree.
-toml_edit = "0.22"
 
 [dev-dependencies]
-tempfile = "3"
 
 [[bin]]
 name = "typio-engine-sherpa"

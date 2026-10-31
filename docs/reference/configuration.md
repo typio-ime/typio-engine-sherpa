@@ -8,6 +8,7 @@ Read from the host's unified config tree under `engines.sherpa-onnx.*`.
 | --- | --- | --- | --- |
 | `engines.sherpa-onnx.model` | string | `""` (auto-detect) | Model directory. An absolute path is used as-is; a relative path is resolved against the data directory, then against `<data-dir>/sherpa-onnx/`. Empty selects `<data-dir>/sherpa-onnx/`. |
 | `engines.sherpa-onnx.language` | string | `""` (auto) | Recognition language hint. Empty becomes `auto`, letting the model decide. |
+| `engines.sherpa-onnx.idle_timeout_seconds` | integer | `1800` (30 min) | Inactivity threshold before the resident model is unloaded from physical memory to reclaim heap (~350 MB RSS). Set to `0` to disable eviction (permanent residency). Reloads transparently on the next `ProcessAudio`. |
 
 ## Model discovery
 
@@ -18,7 +19,7 @@ Read from the host's unified config tree under `engines.sherpa-onnx.*`.
 | Nested match | Otherwise the base directory is scanned one level down for a model subdirectory. |
 | Ambiguity | More than one candidate subdirectory is a **failure**, not a guess: guessing would silently transcribe with the wrong model. |
 | Artifact preference | `model.int8.onnx` is preferred over `model.onnx` when both exist. |
-| Load timing | Lazy — the model loads on the first `ProcessAudio`. `Availability` reports `Ready` only when a model directory resolves. |
+| Load timing | Lazy — the model loads on the first `ProcessAudio` and unloads after `idle_timeout_seconds` of inactivity. `Availability` reports `Ready` whenever a valid model directory resolves on disk. |
 
 ## Supported model family
 

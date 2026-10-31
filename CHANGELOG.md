@@ -1,5 +1,27 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **Configurable idle memory eviction.** Introduced `engines.sherpa-onnx.idle_timeout_seconds`
+  (default: 1800s / 30m; 0 disables). The engine polls its protocol channel with a
+  deadline and unloads the SenseVoice model weights from physical memory after the
+  configured inactivity period, reducing resident memory footprint from ~350 MB to
+  ~10 MB. Subsequent transcription requests reload the model transparently on demand.
+- **On-demand background model acquisition (`setup` task).** Implemented the
+  `setup` task over the Engine Protocol. Invocations spawn a detached
+  worker thread to download, verify, and unpack the default SenseVoice Small int8
+  model into `<data_dir>/sherpa-onnx/` without blocking the protocol event loop
+  or exceeding the host's 5-second command timeout.
+- **Dynamic model enumeration in schema.** `ModelFiles::list_models` discovers
+  all installed models under `<data_dir>/sherpa-onnx/` and populates the
+  `engines.sherpa-onnx.model` schema field's `options`, enabling dropdown selection
+  in GUI settings.
+- **Availability lifecycle reflection.** The engine reports `Availability::Preparing`
+  while background provisioning is running and transitions to `Availability::Ready`
+  once the downloaded model is verified and resident.
+
 ## v0.5.0 - 2026-10-29
 
 ### Breaking

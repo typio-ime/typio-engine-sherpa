@@ -156,6 +156,81 @@ impl ModelFiles {
             tokens,
         })
     }
+
+    /// List all model subdirectory names under `base_dir`.
+    pub fn list_models(base_dir: &Path) -> Vec<String> {
+        let mut models = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(base_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir()
+                    && Self::probe(&path).is_some()
+                    && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                {
+                    models.push(name.to_string());
+                }
+            }
+        }
+        models.sort();
+        models
+    }
+
+    /// Discover models across multiple XDG-compliant search paths.
+    pub fn discover_in_search_dirs(dirs: &[PathBuf]) -> Result<Self, ModelError> {
+        for dir in dirs {
+            if let Ok(files) = Self::discover(dir) {
+                return Ok(files);
+            }
+        }
+        Err(ModelError::NotFound {
+            dir: dirs.first().cloned().unwrap_or_default(),
+        })
+    }
+
+    /// Enumerate all recognizable models across multiple search paths.
+    pub fn list_models_in_search_dirs(dirs: &[PathBuf]) -> Vec<String> {
+        let mut models = Vec::new();
+        for dir in dirs {
+            for m in Self::list_models(dir) {
+                if !models.contains(&m) {
+                    models.push(m);
+                }
+            }
+        }
+        models.sort();
+        models
+    }
+}
+
+/// Canonical XDG-compliant search directories for models.
+pub fn model_search_dirs(custom_data_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(custom) = custom_data_dir {
+        dirs.push(custom.join("sherpa-onnx"));
+    }
+    if let Some(xdg_data) = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
+        let p = xdg_data.join("typio/sherpa-onnx");
+        if !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    } else if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let p = home.join(".local/share/typio/sherpa-onnx");
+        if !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    }
+
+    let system_dirs = [
+        PathBuf::from("/usr/local/share/typio/sherpa-onnx"),
+        PathBuf::from("/usr/share/typio/sherpa-onnx"),
+    ];
+    for sys in system_dirs {
+        if !dirs.contains(&sys) {
+            dirs.push(sys);
+        }
+    }
+
+    dirs
 }
 
 #[cfg(test)]
@@ -242,5 +317,29 @@ mod tests {
         write_model(&root.path().join("model"));
         let files = ModelFiles::discover(root.path()).expect("discover");
         assert!(files.dir().ends_with("model"));
+    }
+
+    #[test]
+    fn list_models_enumerates_valid_directories() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_model(&root.path().join("model-a"));
+        write_model(&root.path().join("model-b"));
+        std::fs::create_dir_all(root.path().join("not-a-model")).expect("mkdir");
+        let list = ModelFiles::list_models(root.path());
+        assert_eq!(list, vec!["model-a", "model-b"]);
+    }
+
+    #[test]
+    fn discover_in_search_dirs_finds_first_valid_location() {
+        let empty_root = tempfile::tempdir().expect("tempdir");
+        let populated_root = tempfile::tempdir().expect("tempdir");
+        write_model(&populated_root.path().join("model-c"));
+
+        let dirs = vec![
+            empty_root.path().to_path_buf(),
+            populated_root.path().to_path_buf(),
+        ];
+        let found = ModelFiles::discover_in_search_dirs(&dirs).expect("discover");
+        assert_eq!(found.dir(), populated_root.path().join("model-c"));
     }
 }

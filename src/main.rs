@@ -20,12 +20,13 @@
 
 mod config;
 mod model;
+mod setup;
 
 #[cfg(feature = "native")]
 mod sherpa;
 
 use std::fs::File;
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 
 use typio_engine_protocol::{
@@ -84,11 +85,17 @@ const ENGINE_NAME: &str = "sherpa-onnx";
 const MODEL_KEY: &str = "engines.sherpa-onnx.model";
 /// Recognition language hint.
 const LANGUAGE_KEY: &str = "engines.sherpa-onnx.language";
+/// Idle timeout in seconds before unloading the model.
+const IDLE_TIMEOUT_KEY: &str = "engines.sherpa-onnx.idle_timeout_seconds";
 
 /// Languages SenseVoice supports. `"auto"` lets the model decide.
 const LANGUAGES: &[&str] = &["auto", "zh", "en", "ja", "ko", "yue"];
 
 fn schema() -> Vec<SchemaField> {
+    let mut model_options = vec![String::new()];
+    let search_dirs = model::model_search_dirs(None);
+    model_options.extend(ModelFiles::list_models_in_search_dirs(&search_dirs));
+
     vec![
         SchemaField {
             key: MODEL_KEY.to_string(),
@@ -98,7 +105,7 @@ fn schema() -> Vec<SchemaField> {
             minimum: 0,
             maximum: 0,
             step: 0,
-            options: Vec::new(),
+            options: model_options,
             runtime_property: None,
         },
         SchemaField {
@@ -112,6 +119,17 @@ fn schema() -> Vec<SchemaField> {
             options: std::iter::once(String::new())
                 .chain(LANGUAGES.iter().map(|value| (*value).to_string()))
                 .collect(),
+            runtime_property: None,
+        },
+        SchemaField {
+            key: IDLE_TIMEOUT_KEY.to_string(),
+            default: SchemaDefault::Integer(1800),
+            label: Some("Idle Unload Timeout (seconds)".to_string()),
+            section: Some("Memory".to_string()),
+            minimum: 0,
+            maximum: 86400,
+            step: 60,
+            options: Vec::new(),
             runtime_property: None,
         },
     ]
@@ -130,33 +148,65 @@ struct Engine {
     recognizer: Option<Backend>,
     /// Why the last load attempt failed, so `Availability` can explain itself.
     load_error: Option<String>,
+    /// Instant when the last transcription completed, driving idle eviction.
+    last_active: Option<std::time::Instant>,
+    /// Detached background setup manager for acquiring models on demand.
+    setup_manager: setup::SetupManager,
 }
 
 impl Engine {
-    /// Resolve the configured model directory to an absolute path.
-    ///
-    /// An absolute setting is used as-is. A relative setting is resolved against
-    /// the host's data directory, then against `<data_dir>/sherpa-onnx`, which is
-    /// where the installer places models. An empty setting falls back to
-    /// `<data_dir>/sherpa-onnx` so a stock install works with no configuration.
-    fn resolve_model_dir(&self) -> PathBuf {
-        let base = self.data_dir.join("sherpa-onnx");
-        match self.config.model.as_deref() {
-            Some(setting) => {
-                let path = PathBuf::from(setting);
-                if path.is_absolute() {
-                    path
-                } else {
-                    let under_data = self.data_dir.join(&path);
-                    if under_data.exists() {
-                        under_data
-                    } else {
-                        base.join(&path)
-                    }
+    /// Return the remaining duration before the resident model should be evicted,
+    /// or `None` if no model is loaded or idle eviction is disabled.
+    fn time_until_idle_eviction(&self) -> Option<std::time::Duration> {
+        if self.recognizer.is_none() || self.config.idle_timeout_seconds == 0 {
+            return None;
+        }
+        let timeout = std::time::Duration::from_secs(self.config.idle_timeout_seconds);
+        let last = self.last_active.unwrap_or_else(std::time::Instant::now);
+        Some(timeout.saturating_sub(last.elapsed()))
+    }
+
+    /// Drop the resident model if one is loaded, reclaiming physical memory.
+    fn unload_idle(&mut self) {
+        if self.recognizer.is_some() {
+            log(&format!(
+                "idle timeout ({}s) reached; unloaded model to reclaim memory",
+                self.config.idle_timeout_seconds
+            ));
+            self.recognizer = None;
+            self.last_active = None;
+        }
+    }
+
+    /// Resolve the target model directory, searching multi-tier XDG paths if unspecified.
+    fn resolve_model(&self) -> Result<ModelFiles, model::ModelError> {
+        let mut search_dirs = Vec::new();
+        if self.data_dir.as_os_str().is_empty() {
+            search_dirs.extend(model::model_search_dirs(None));
+        } else {
+            search_dirs.push(self.data_dir.join("sherpa-onnx"));
+            // Include system paths if the data directory is not an isolated test path.
+            if !self.data_dir.starts_with("/tmp") {
+                search_dirs.push(PathBuf::from("/usr/local/share/typio/sherpa-onnx"));
+                search_dirs.push(PathBuf::from("/usr/share/typio/sherpa-onnx"));
+            }
+        }
+
+        if let Some(setting) = self.config.model.as_deref() {
+            let path = PathBuf::from(setting);
+            if path.is_absolute() {
+                return ModelFiles::discover(&path);
+            }
+            for base in &search_dirs {
+                let candidate = base.join(&path);
+                if candidate.exists() {
+                    return ModelFiles::discover(&candidate);
                 }
             }
-            None => base,
+            return ModelFiles::discover(&search_dirs[0].join(&path));
         }
+
+        ModelFiles::discover_in_search_dirs(&search_dirs)
     }
 
     /// Load a recognizer if one is not already resident.
@@ -171,9 +221,8 @@ impl Engine {
             // Retry only after a ReloadConfig clears it.
             return Err(error.clone());
         }
-        let dir = self.resolve_model_dir();
         let language = self.config.language.as_deref().unwrap_or("auto");
-        match ModelFiles::discover(&dir) {
+        match self.resolve_model() {
             Ok(files) => match Backend::load(&files, language) {
                 Ok(backend) => {
                     log(&format!(
@@ -220,6 +269,7 @@ impl Engine {
         self.config = config;
         self.recognizer = None;
         self.load_error = None;
+        self.last_active = None;
         Ok(())
     }
 
@@ -232,10 +282,16 @@ impl Engine {
         if self.recognizer.is_some() {
             return Availability::Ready;
         }
+        if self.setup_manager.is_running() {
+            return Availability::Preparing;
+        }
+        if self.setup_manager.status() == setup::SetupStatus::Completed {
+            self.load_error = None;
+        }
         if self.load_error.is_some() {
             return Availability::Failed;
         }
-        match ModelFiles::discover(&self.resolve_model_dir()) {
+        match self.resolve_model() {
             Ok(_) => Availability::Ready,
             Err(error) => {
                 self.load_error = Some(error.to_string());
@@ -260,8 +316,10 @@ impl Engine {
             ));
         }
         Ok(payload
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect())
     }
 
@@ -288,6 +346,7 @@ impl Engine {
         if text.is_empty() {
             return Err("recognizer produced no text for non-silent audio".to_string());
         }
+        self.last_active = Some(std::time::Instant::now());
         Ok(text)
     }
 }
@@ -296,6 +355,48 @@ impl Engine {
 /// never carry diagnostics.
 fn log(message: &str) {
     eprintln!("[sherpa-onnx] {message}");
+}
+
+/// Wait until fd becomes readable or the specified timeout expires.
+///
+/// Returns `Ok(true)` if data is available to read, `Ok(false)` on timeout,
+/// or an error if the descriptor is broken.
+fn wait_for_frame(fd: i32, timeout: Option<std::time::Duration>) -> Result<bool, std::io::Error> {
+    let deadline = timeout.map(|duration| std::time::Instant::now() + duration);
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let timeout_ms = match deadline {
+            Some(target) => {
+                let remaining = target.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Ok(false);
+                }
+                remaining.as_millis().clamp(1, i32::MAX as u128) as i32
+            }
+            None => -1,
+        };
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if result > 0 {
+            if descriptor.revents & libc::POLLNVAL != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "engine protocol descriptor became invalid",
+                ));
+            }
+            return Ok(true);
+        }
+        if result == 0 {
+            return Ok(false);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -346,35 +447,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine.load_error = Some(error);
     }
 
-    // Host closed the channel: normal teardown.
-    while let Ok(frame) = read_frame(&mut channel) {
-        if frame.message_type != MessageType::Request || frame.request_id == 0 {
-            return Err(format!(
-                "expected REQUEST with a nonzero request id, got {:?} id {}",
-                frame.message_type, frame.request_id
-            )
-            .into());
-        }
+    let fd = channel.as_raw_fd();
 
-        let request = match Request::decode(&frame.payload) {
-            Ok(request) => request,
-            Err(error) => {
-                respond(
-                    &mut channel,
-                    frame.request_id,
-                    vec![ReplyRecord::Error(error.to_string())],
-                )?;
-                continue;
+    loop {
+        let timeout = engine.time_until_idle_eviction();
+        if timeout.is_some_and(|d| d.is_zero()) {
+            engine.unload_idle();
+        }
+        let timeout = engine.time_until_idle_eviction();
+
+        match wait_for_frame(fd, timeout) {
+            Ok(true) => {
+                let frame = match read_frame(&mut channel) {
+                    Ok(frame) => frame,
+                    // Host closed the channel: normal teardown.
+                    Err(typio_engine_protocol::ProtocolError::Io(_)) => break,
+                    Err(error) => return Err(error.into()),
+                };
+
+                if frame.message_type != MessageType::Request || frame.request_id == 0 {
+                    return Err(format!(
+                        "expected REQUEST with a nonzero request id, got {:?} id {}",
+                        frame.message_type, frame.request_id
+                    )
+                    .into());
+                }
+
+                let request = match Request::decode(&frame.payload) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        respond(
+                            &mut channel,
+                            frame.request_id,
+                            vec![ReplyRecord::Error(error.to_string())],
+                        )?;
+                        continue;
+                    }
+                };
+
+                if matches!(request, Request::Shutdown) {
+                    let _ = respond(&mut channel, frame.request_id, vec![ReplyRecord::Ok]);
+                    break;
+                }
+
+                let records = handle(&mut engine, request);
+                respond(&mut channel, frame.request_id, records)?;
             }
-        };
-
-        if matches!(request, Request::Shutdown) {
-            let _ = respond(&mut channel, frame.request_id, vec![ReplyRecord::Ok]);
-            break;
+            Ok(false) => {
+                // Poll timeout expired: idle period reached.
+                engine.unload_idle();
+            }
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::BrokenPipe {
+                    break;
+                }
+                return Err(error.into());
+            }
         }
-
-        let records = handle(&mut engine, request);
-        respond(&mut channel, frame.request_id, records)?;
     }
 
     Ok(())
@@ -400,15 +529,37 @@ fn handle(engine: &mut Engine, request: Request) -> Vec<ReplyRecord> {
                 vec![ReplyRecord::Error(error)]
             }
         },
+        Request::ListCommands => vec![
+            ReplyRecord::Command(typio_engine_protocol::Command {
+                id: "setup".to_string(),
+                label: "Download default SenseVoice model".to_string(),
+            }),
+            ReplyRecord::Ok,
+        ],
+        Request::InvokeCommand(ref id) if id == "setup" => {
+            match engine.setup_manager.start_setup(engine.data_dir.clone()) {
+                Ok(started) => {
+                    if started {
+                        log("started background setup worker for default model");
+                    } else {
+                        log("setup already in progress or model already resident");
+                    }
+                    vec![ReplyRecord::Ok]
+                }
+                Err(error) => {
+                    log(&format!("failed to start setup: {error}"));
+                    vec![ReplyRecord::Error(error)]
+                }
+            }
+        }
+        Request::InvokeCommand(id) => vec![ReplyRecord::Error(format!("unknown command '{id}'"))],
         Request::FocusIn(_)
         | Request::FocusOut(_)
         | Request::Reset(_)
         | Request::Deactivate
         | Request::ListModes
         | Request::GetActiveMode(_)
-        | Request::SetActiveMode { .. }
-        | Request::ListCommands
-        | Request::InvokeCommand(_) => vec![ReplyRecord::Ok],
+        | Request::SetActiveMode { .. } => vec![ReplyRecord::Ok],
         Request::ProcessKey(_) => vec![ReplyRecord::Error(
             "keyboard input is not supported by a voice engine".to_string(),
         )],
@@ -516,5 +667,126 @@ mod tests {
             ..Engine::default()
         };
         assert_eq!(engine.availability(), Availability::Failed);
+    }
+
+    #[test]
+    fn wait_for_frame_detects_timeout_and_readiness() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        let (mut sender, receiver) = UnixStream::pair().expect("socketpair");
+        let fd = receiver.as_raw_fd();
+
+        // No data sent: expires cleanly
+        let ready = wait_for_frame(fd, Some(std::time::Duration::from_millis(10))).expect("wait");
+        assert!(!ready);
+
+        // Send data: detects readiness
+        sender.write_all(b"x").expect("write");
+        let ready = wait_for_frame(fd, Some(std::time::Duration::from_millis(50))).expect("wait");
+        assert!(ready);
+    }
+
+    #[test]
+    fn idle_eviction_duration_is_none_without_resident_backend() {
+        let engine = engine_with("/tmp");
+        assert_eq!(engine.time_until_idle_eviction(), None);
+    }
+
+    #[test]
+    fn idle_eviction_duration_is_none_when_timeout_is_zero() {
+        let mut engine = engine_with("/tmp");
+        engine.config.idle_timeout_seconds = 0;
+        engine.last_active = Some(std::time::Instant::now());
+        #[cfg(not(feature = "native"))]
+        {
+            engine.recognizer = Some(Backend);
+            assert_eq!(engine.time_until_idle_eviction(), None);
+        }
+    }
+
+    #[test]
+    fn idle_eviction_unloads_recognizer() {
+        let mut engine = engine_with("/tmp");
+        engine.config.idle_timeout_seconds = 1800;
+        #[cfg(not(feature = "native"))]
+        {
+            engine.recognizer = Some(Backend);
+            engine.last_active = Some(std::time::Instant::now());
+            assert!(engine.time_until_idle_eviction().is_some());
+            engine.unload_idle();
+            assert!(engine.recognizer.is_none());
+            assert!(engine.last_active.is_none());
+            assert_eq!(engine.time_until_idle_eviction(), None);
+        }
+    }
+
+    #[test]
+    fn invoke_unknown_command_returns_error() {
+        let mut engine = Engine::default();
+        let records = handle(&mut engine, Request::InvokeCommand("unknown".to_string()));
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            ReplyRecord::Error(err) => assert!(err.contains("unknown command 'unknown'")),
+            other => panic!("expected ReplyRecord::Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_commands_reports_setup_task() {
+        let mut engine = Engine::default();
+        let records = handle(&mut engine, Request::ListCommands);
+        assert_eq!(records.len(), 2);
+        match &records[0] {
+            ReplyRecord::Command(cmd) => {
+                assert_eq!(cmd.id, "setup");
+                assert_eq!(cmd.label, "Download default SenseVoice model");
+            }
+            other => panic!("expected ReplyRecord::Command, got {other:?}"),
+        }
+        assert_eq!(records[1], ReplyRecord::Ok);
+    }
+
+    #[test]
+    fn invoke_setup_returns_ok_and_reflects_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model_dir = dir
+            .path()
+            .join("sherpa-onnx")
+            .join(setup::DEFAULT_MODEL_DIR_NAME);
+        std::fs::create_dir_all(&model_dir).expect("mkdir");
+        std::fs::write(model_dir.join("tokens.txt"), "<unk> 0\n").expect("tokens");
+        std::fs::write(model_dir.join("model.int8.onnx"), b"int8").expect("model");
+
+        let mut engine = Engine {
+            data_dir: dir.path().to_path_buf(),
+            ..Engine::default()
+        };
+
+        let records = handle(&mut engine, Request::InvokeCommand("setup".to_string()));
+        assert_eq!(records, vec![ReplyRecord::Ok]);
+        assert_eq!(engine.setup_manager.status(), setup::SetupStatus::Completed);
+        assert_eq!(engine.availability(), Availability::Ready);
+    }
+
+    #[test]
+    fn resolve_model_discovers_nested_model_under_data_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model_dir = dir
+            .path()
+            .join("sherpa-onnx")
+            .join("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17");
+        std::fs::create_dir_all(&model_dir).expect("mkdir");
+        std::fs::write(model_dir.join("tokens.txt"), "<unk> 0\n").expect("tokens");
+        std::fs::write(model_dir.join("model.int8.onnx"), b"int8").expect("model");
+
+        let mut engine = Engine {
+            data_dir: dir.path().to_path_buf(),
+            ..Engine::default()
+        };
+
+        let resolved = engine.resolve_model().expect("resolve");
+        assert_eq!(resolved.dir(), model_dir);
+        assert_eq!(engine.availability(), Availability::Ready);
     }
 }

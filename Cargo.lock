@@ -347,6 +347,7 @@ version = "0.1.0"
 name = "typio-engine-sherpa"
 version = "0.5.0"
 dependencies = [
+ "libc",
  "sherpa-onnx-sys",
  "tempfile",
  "toml_edit",
